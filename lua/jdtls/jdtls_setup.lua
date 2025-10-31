@@ -3,7 +3,6 @@ local M = {}
 function M:setup()
     local project_name = vim.fn.fnamemodify(vim.fn.getcwd(), ":p:h:t")
     local workspace_dir = vim.fn.stdpath("data") .. package.config:sub(1,1) .. "jdtls-workspace" .. package.config:sub(1,1) .. project_name
-    local os_name = vim.loop.os_uname().sysname
     local config = {
         -- The command that starts the language server
         -- See: https://github.com/eclipse/eclipse.jdt.ls#running-from-the-command-line
@@ -33,7 +32,7 @@ function M:setup()
 
             -- 💀
             "-configuration",
-            vim.fn.stdpath("data") .. package.config:sub(1,1) .. "mason" .. package.config:sub(1,1) .. "packages" .. package.config:sub(1,1) .. "jdtls" .. package.config:sub(1,1) .. "config_" .. (os_name == "Windows_NT" and "win" or os_name == "Linux" and "linux" or "mac"),
+            vim.fn.stdpath("data") .. package.config:sub(1,1) .. "mason" .. package.config:sub(1,1) .. "packages" .. package.config:sub(1,1) .. "jdtls" .. package.config:sub(1,1) .. "config_" .. "mac_arm",
             -- eclipse.jdt.ls installation            Depending on your system.
 
             -- 💀

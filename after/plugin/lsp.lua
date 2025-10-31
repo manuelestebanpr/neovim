@@ -24,18 +24,10 @@ vim.api.nvim_create_autocmd('LspAttach', {
     end,
 })
 
-vim.lsp.config('lua_ls', {
-    settings = {
-        Lua = {
-            diagnostics = {
-                disable = {
-                    "undefined-global",
-                    "undefined-field"
-                }
-            },
-        }
-    }
-})
+vim.lsp.enable('gopls')
+vim.lsp.enable('lua_ls')
+vim.lsp.enable('phpactor')
+
 
 vim.diagnostic.config({
     virtual_text = true,
