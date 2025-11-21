@@ -1,9 +1,9 @@
 local M = {}
 
 -- =============================================================================
--- CONFIGURATION CONSTANTS
+-- 1. CONFIGURATION CONSTANTS
 -- =============================================================================
-
+-- Custom file location TODO: need to update this so its loaded from .env
 local HYBRIS_ROOT = "/Users/manuel.perez02/Documents/cert/hybriscert/hybris"
 local JAVA_21_HOME = "/Users/manuel.perez02/.sdkman/candidates/java/21.0.9-sapmchn"
 
@@ -15,8 +15,11 @@ local CONFIG_PATH = MASON_PATH .. "/config_mac"
 -- Logging
 local LOG_FILE = os.getenv("HOME") .. "/jdtls_nvim.log"
 
+-- Cache for filesystem lookups
+local PATH_CACHE = {}
+
 -- =============================================================================
--- LOGGING UTILITIES
+-- 2. UTILITIES (LOGGING & I/O)
 -- =============================================================================
 
 local function clear_log()
@@ -27,247 +30,290 @@ local function clear_log()
     end
 end
 
-local function log(msg)
+local function log(msg, indent_level)
     local file = io.open(LOG_FILE, "a")
-    if file then
-        file:write(os.date("!%Y-%m-%dTH%M%S") .. " - " .. msg .. "\n")
-        file:close()
-    end
+    if not file then return end
+
+    local indent = indent_level and (string.rep("  ", indent_level) .. "↳ ") or ""
+    file:write(os.date("!%Y-%m-%dTH%M%S") .. " - " .. indent .. msg .. "\n")
+    file:close()
+end
+
+--- Optimized Pure Lua File Copy (Avoids os.execute shell spawn)
+local function copy_file_lua(src, dest)
+    local infile = io.open(src, "rb")
+    if not infile then return false end
+    local content = infile:read("*a")
+    infile:close()
+
+    local outfile = io.open(dest, "wb")
+    if not outfile then return false end
+    outfile:write(content)
+    outfile:close()
+    return true
 end
 
 -- =============================================================================
--- SIMPLIFIED EXTENSION FINDER
+-- 3. FILESYSTEM & PARSING
 -- =============================================================================
 
-local function get_hybris_extensions_workspace_paths()
-    log("Parsing localextensions.xml for optimized path resolution...")
+--- Locates an extension using Cache first, then 'find'
+local function resolve_extension_path_fs(ext_name)
+    if PATH_CACHE[ext_name] then return PATH_CACHE[ext_name] end
 
-    local config_file = HYBRIS_ROOT .. "/config/localextensions.xml"
-    local f = io.open(config_file, "r")
+    local search_dirs = {
+        HYBRIS_ROOT .. "/bin/custom/",
+        HYBRIS_ROOT .. "/bin/modules/",
+    }
+
+    for _, search_base in ipairs(search_dirs) do
+        local cmd = string.format("find %s -maxdepth 3 -type d -name '%s' -print -quit", search_base, ext_name)
+        local path = vim.fn.system(cmd):gsub("%s+", "")
+
+        if path ~= "" then
+            PATH_CACHE[ext_name] = path
+            return path
+        end
+    end
+
+    PATH_CACHE[ext_name] = nil
+    return nil
+end
+
+local function get_required_extensions(extension_path)
+    local f = io.open(extension_path .. "/extensioninfo.xml", "r")
     if not f then return {} end
+    local content = f:read("*a")
+    f:close()
 
+    local requires = {}
+    for name in content:gmatch('<requires%-extension[^>]*name="([^"]+)"') do
+        table.insert(requires, name)
+    end
+    return requires
+end
+
+local function get_local_extensions_map()
+    local f = io.open(HYBRIS_ROOT .. "/config/localextensions.xml", "r")
+    if not f then return {} end
     local xml_content = f:read("*a")
     f:close()
 
-    local active_extensions = {}
-    local resolved_paths = {}
-
+    local active_map = {}
     for line in xml_content:gmatch("[^\r\n]+") do
         if not line:match("^%s*<!%-%-") then
             local ext_name = line:match('<extension%s+name="([^"]+)"')
-            if ext_name then
-                active_extensions[ext_name] = true
-            end
+            if ext_name then active_map[ext_name] = true end
 
             local explicit_dir = line:match('<path%s+dir="([^"]+)"')
             if explicit_dir then
                 local full_path = explicit_dir:gsub("${HYBRIS_BIN_DIR}", HYBRIS_ROOT .. "/bin")
                 local derived_name = full_path:match("([^/]+)$")
-                active_extensions[derived_name] = full_path -- Store directly as path
+                active_map[derived_name] = full_path
+                PATH_CACHE[derived_name] = full_path
             end
         end
     end
-
-    local function find_extension_path(name)
-        local search_dirs = {
-            HYBRIS_ROOT .. "/bin/custom/",
-            HYBRIS_ROOT .. "/bin/modules/",
-        }
-
-        for _, search_base in ipairs(search_dirs) do
-            local cmd = string.format("find %s -maxdepth 3 -type d -name '%s' -print -quit", search_base, name)
-            local path = vim.fn.system(cmd)
-
-            path = path:gsub("%s+", "")
-
-            if path ~= "" then
-                return path
-            end
-        end
-        return nil
-    end
-
-    for name, value in pairs(active_extensions) do
-        local path = value
-
-        if type(value) ~= "string" then
-            path = find_extension_path(name)
-
-            if not path then
-                log("warning: [" .. name .. "] listed in config but not found in /bin/custom or /bin/modules.")
-            end
-        end
-
-        if path and path ~= "" then
-            log("Local Extension Defined (Name): [" .. name .. "] -> " .. path)
-            resolved_paths[name] = path
-        end
-    end
-
-    local path_list = {}
-    table.insert(path_list, HYBRIS_ROOT)
-    table.insert(path_list, HYBRIS_ROOT .. "/bin/platform")
-
-    for _, path in pairs(resolved_paths) do
-        table.insert(path_list, path)
-    end
-
-    return path_list
+    return active_map
 end
 
-local function get_current_extension_root()
-    local current_file = vim.api.nvim_buf_get_name(0)
-    if current_file == "" then return nil end
+-- =============================================================================
+-- 4. RECURSIVE DEPENDENCY RESOLVER
+-- =============================================================================
 
-    local lines = vim.api.nvim_buf_get_lines(0, 0, 20, false)
-    local chunk = table.concat(lines, "\n")
+local function resolve_dependencies_recursive(ext_name, collected_paths, visited, local_ext_map, level)
+    if visited[ext_name] then return end
+    visited[ext_name] = true
 
-    local pkg_name = chunk:match("package%s+([%w%.]+);")
-
-    if not pkg_name then
-        return nil
+    local path = local_ext_map[ext_name]
+    if type(path) ~= "string" then
+        path = resolve_extension_path_fs(ext_name)
     end
 
-    local pkg_path = pkg_name:gsub("%.", "/")
-
-    local idx = current_file:find(pkg_path, 1, true)
-
-    if not idx then
-        log("Error: File path does not match package declaration.")
-        return nil
+    if not path then
+        log("Warning: Dependency [" .. ext_name .. "] not found.", level)
+        return
     end
 
-    -- 4. Extract the 'Source Root' by cutting the string at the index
-    -- Input:  /hybris/bin/custom/myext/src/com/my/commerce/core/File.java
-    -- Cut at 'com/...'
-    -- Result: /hybris/bin/custom/myext/src/
-    local source_root = current_file:sub(1, idx - 1)
+    if not collected_paths[path] then
+        collected_paths[path] = true
+        log("Resolved: [" .. ext_name .. "]", level)
+    end
 
-    source_root = source_root:gsub("/$", "")
-
-    local extension_root = vim.fn.fnamemodify(source_root, ":h")
-
-    if vim.fn.filereadable(extension_root .. "/.classpath") == 1 then
-        local ext_name = vim.fn.fnamemodify(extension_root, ":t")
-
-        log("--- Extension Detected (Fast Jump) ---")
-        log("Name: " .. ext_name)
-        log("Path: " .. extension_root)
-        log("--------------------------------------")
-        return extension_root
-    else
-        -- Edge Case: Sometimes structure is 'myext/web/src'. 
-        -- If .classpath isn't found, try one level higher.
-        local parent_up = vim.fn.fnamemodify(extension_root, ":h")
-        if vim.fn.filereadable(parent_up .. "/.classpath") == 1 then
-            return parent_up
-        end
-
-        log("Warning: Calculated root " .. extension_root .. " has no .classpath")
-        return nil
+    for _, child_name in ipairs(get_required_extensions(path)) do
+        resolve_dependencies_recursive(child_name, collected_paths, visited, local_ext_map, level + 1)
     end
 end
 
 -- =============================================================================
--- JDTLS SETUP
+-- 5. CLASSPATH PARCHER FOR .classpath files
+-- =============================================================================
+local function inject_classpath_dependencies(target_ext_path, dependency_paths)
+    local classpath_file = target_ext_path .. "/.classpath"
+    local backup_file = target_ext_path .. "/.classpath.nvim_bak"
+
+    -- 1. Idempotency: Restore backup if exists, else create one
+    if vim.fn.filereadable(backup_file) == 1 then
+        copy_file_lua(backup_file, classpath_file)
+    else
+        copy_file_lua(classpath_file, backup_file)
+    end
+
+    local f = io.open(classpath_file, "r")
+    if not f then return end
+    local content = f:read("*a")
+    f:close()
+
+    -- 2. Generate Entries
+    local entries_list = {}
+    table.insert(entries_list, '\n\t')
+
+    for path, _ in pairs(dependency_paths) do
+        if path ~= target_ext_path
+            and path ~= HYBRIS_ROOT
+            and path ~= (HYBRIS_ROOT .. "/bin/platform")
+            and path ~= (HYBRIS_ROOT .. "/bin/modules") then
+
+            -- Use Project Name only (Linked Resource style)
+            local ext_name = vim.fn.fnamemodify(path, ":t")
+            local entry = string.format('\t<classpathentry exported="false" kind="src" path="/%s" />', ext_name)
+            table.insert(entries_list, entry)
+        end
+    end
+
+    table.insert(entries_list, '\t\n')
+
+    -- 3. Inject & Write
+    local injection_str = table.concat(entries_list, "\n")
+    local new_content = content:gsub("</classpath>", injection_str .. "</classpath>")
+
+    local fw = io.open(classpath_file, "w")
+    if fw then
+        fw:write(new_content)
+        fw:close()
+        log("Injected dependencies into .classpath (Excluding platform/root/modules).")
+    end
+end
+-- =============================================================================
+-- 6. JDTLS SETUP
 -- =============================================================================
 
 function M.setup()
     clear_log()
-    log("Initializing JDTLS Setup for SAP Commerce...")
+    log("Initializing Optimized JDTLS Setup...")
+
     if vim.fn.isdirectory(JAVA_21_HOME) == 0 then
-        vim.notify("JDTLS Error: Java 21 not found", vim.log.levels.ERROR)
-        return
+        return vim.notify("JDTLS Error: Java 21 not found", vim.log.levels.ERROR)
     end
 
-    -- 1. Workspace Directory (Cache)
-    local root_hash = vim.fn.sha256(HYBRIS_ROOT)
-    local workspace_dir = os.getenv("HOME") .. "/.local/share/nvim/sapcommerce/hybris_" .. root_hash
+    -- Context Detection
+    local current_file = vim.api.nvim_buf_get_name(0)
+    local current_ext_path = nil
+    local current_ext_name = nil
 
-    -- 2. Resolve Extension Paths
-    local active_local_extensions = get_hybris_extensions_workspace_paths()
-    local extension_root = get_current_extension_root()
-
-    -- 3. Generate Workspace Folders (Unique & Prefixed with file://)
-    local workspace_folders_gen = {}
-    local seen_paths = {}
-
-    -- Helper to ensure we don't add duplicate folders
-    local function add_workspace_folder(path)
-        if path and path ~= "" and not seen_paths[path] then
-            table.insert(workspace_folders_gen, "file://" .. path)
-            seen_paths[path] = true
+    if current_file ~= "" then
+        local root = vim.fs.root(current_file, {".classpath", "extensioninfo.xml"})
+        if root then
+            current_ext_path = root
+            current_ext_name = vim.fn.fnamemodify(root, ":t")
+            log("Context: " .. current_ext_name)
         end
     end
 
-    -- A. Priority: Root and Platform
-    add_workspace_folder(HYBRIS_ROOT)
-    add_workspace_folder(HYBRIS_ROOT .. "/bin/platform")
+    -- Cache Config
+    local root_hash = vim.fn.sha256(HYBRIS_ROOT .. (current_ext_name or "global"))
+    local workspace_dir = os.getenv("HOME") .. "/.local/share/nvim/sapcommerce/hybris_" .. root_hash
 
-    -- B. Priority: Current detected extension (where I am editing now)
-    if extension_root then
-        add_workspace_folder(extension_root)
+    -- Dependency Resolution
+    local local_ext_map = get_local_extensions_map()
+    local all_paths = {}
+
+    -- Always include Platform & Root
+    all_paths[HYBRIS_ROOT] = true
+    all_paths[HYBRIS_ROOT .. "/bin/platform"] = true
+
+    -- Include Local Extensions
+    for name, val in pairs(local_ext_map) do
+        local path = (type(val) == "string") and val or resolve_extension_path_fs(name)
+        if path then all_paths[path] = true end
     end
 
-    -- C. Priority: All other active extensions from config
-    for _, path in ipairs(active_local_extensions) do
-        add_workspace_folder(path)
+    -- Recursive Dependencies (If inside an extension)
+    if current_ext_path then
+        all_paths[current_ext_path] = true
+        resolve_dependencies_recursive(current_ext_name, all_paths, {}, local_ext_map, 0)
+        inject_classpath_dependencies(current_ext_path, all_paths)
     end
 
-    log("Total workspace folders loaded: " .. #workspace_folders_gen)
+    -- Workspace Folders Generation
+    local workspace_folders = {}
+    for path, _ in pairs(all_paths) do
+        table.insert(workspace_folders, "file://" .. path)
+    end
+    log("Workspace Folders: " .. #workspace_folders)
 
-    -- 4. Command
-    local cmd = {
-        JAVA_21_HOME .. "/bin/java",
-        "-Declipse.application=org.eclipse.jdt.ls.core.id1",
-        "-Dosgi.bundles.defaultStartLevel=4",
-        "-Declipse.product=org.eclipse.jdt.ls.core.product",
-        "-Dlog.protocol=true",
-        "-Dlog.level=ALL",
-        "-Xmx4g",
-        "--add-modules=ALL-SYSTEM",
-        "--add-opens", "java.base/java.util=ALL-UNNAMED",
-        "--add-opens", "java.base/java.lang=ALL-UNNAMED",
-        "-jar", JDTLS_JAR,
-        "-configuration", CONFIG_PATH,
-        "-data", workspace_dir,
-    }
-
-    -- 5. Configuration
-    local config = {
-        cmd = cmd,
+    -- Start JDTLS
+    require("jdtls").start_or_attach({
+        cmd = {
+            JAVA_21_HOME .. "/bin/java",
+            "-Declipse.application=org.eclipse.jdt.ls.core.id1",
+            "-Dosgi.bundles.defaultStartLevel=4",
+            "-Declipse.product=org.eclipse.jdt.ls.core.product",
+            "-Dlog.protocol=true",
+            "-Dlog.level=ALL",
+            "-Xmx4g",
+            "--add-modules=ALL-SYSTEM",
+            "--add-opens", "java.base/java.util=ALL-UNNAMED",
+            "--add-opens", "java.base/java.lang=ALL-UNNAMED",
+            "-jar", JDTLS_JAR,
+            "-configuration", CONFIG_PATH,
+            "-data", workspace_dir,
+        },
         root_dir = HYBRIS_ROOT,
         capabilities = require('cmp_nvim_lsp').default_capabilities(),
         settings = {
             java = {
                 signatureHelp = { enabled = true },
+                contentProvider = { preferred = "fernflower" },
                 configuration = {
-                    runtimes = {
-                        { name = "JavaSE-21", path = JAVA_21_HOME },
-                    }
-                },
-                import = {
-                    gradle = { enabled = true },
-                    maven = { enabled = true }
+                    runtimes = { { name = "JavaSE-21", path = JAVA_21_HOME } }
                 },
             },
         },
         init_options = {
             bundles = {},
-            workspaceFolders = workspace_folders_gen
+            workspaceFolders = workspace_folders
         },
-        on_attach = function (client)
-            log("JDTLS Client Attached. ID: " .. client.id)
+        on_attach = function(client, bufnr)
 
-            local folders = client.workspace_folders
-            if folders then
-                log("Workspace folders confirmed by client: " .. #folders)
-            else
-                log("No workspace folders detected by client.")
+            log("JDTLS Attached. ID: " .. client.id)
+
+            local function restore_classpath()
+                local current_buf_name = vim.api.nvim_buf_get_name(bufnr)
+                local root = vim.fs.root(current_buf_name, {".classpath.nvim_bak"})
+
+                if root then
+                    local src = root .. "/.classpath.nvim_bak"
+                    local dest = root .. "/.classpath"
+
+                    if copy_file_lua(src, dest) then
+                        vim.notify("Success: .classpath restored from backup.", vim.log.levels.INFO)
+                        log("Manual Restore: .classpath restored for " .. root)
+                    else
+                        vim.notify("Error: Failed to restore .classpath.", vim.log.levels.ERROR)
+                    end
+                else
+                    vim.notify("No backup (.classpath.nvim_bak) found for this project.", vim.log.levels.WARN)
+                end
             end
+
+            vim.keymap.set("n", "<leader>cld", restore_classpath, {
+                buffer = bufnr,
+                desc = "Restore original .classpath (remove injected dependencies)"
+            })
+
         end
-    }
-    require("jdtls").start_or_attach(config)
+    })
 end
 
 return M
