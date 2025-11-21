@@ -4,9 +4,9 @@ local M = {}
 -- CONFIGURATION CONSTANTS
 -- =============================================================================
 
-local HYBRIS_ROOT = "/Users/manolo/Documents/sapcommerce/hybriscert/hybris"
-local JAVA_21_HOME = "/Users/manolo/.sdkman/candidates/java/21.0.9-sapmchn"
-local JAVA_17_HOME = "/Users/manolo/.sdkman/candidates/java/17.0.17-sapmchn"
+local HYBRIS_ROOT = "/Users/manuel.perez02/Documents/cert/hybriscert/hybris"
+local JAVA_21_HOME = "/Users/manuel.perez02/.sdkman/candidates/java/21.0.9-sapmchn"
+local JAVA_17_HOME = "/Users/manuel.perez02/.sdkman/candidates/java/17.0.17-sapmchn"
 
 -- JDTLS Paths
 local MASON_PATH = os.getenv("HOME") .. "/.local/share/nvim/mason/packages/jdtls"
@@ -52,15 +52,20 @@ function M.setup()
     local root_hash = vim.fn.sha256(HYBRIS_ROOT)
     local workspace_dir = os.getenv("HOME") .. "/.local/share/nvim/sapcommerce/hybris_" .. root_hash
 
-    -- Define workspace folders
-    -- For JDTLS to correctly validate, it needs to understand the project structure.
-    -- These should ideally point to the root of your Java projects/modules.
-    local workspace_folders = {
-        HYBRIS_ROOT .. "/bin/platform", -- Core platform sources and compiled classes
+    -- Define raw paths
+    local project_paths = {
+        HYBRIS_ROOT,
+        HYBRIS_ROOT .. "/bin/platform",
         HYBRIS_ROOT .. "/bin/custom/trainingflexiblesearch",
         HYBRIS_ROOT .. "/bin/custom/dev",
+        HYBRIS_ROOT .. "/bin/modules",
     }
 
+    local function add_workspace_folder(paths)
+        for _, path in ipairs(paths) do
+            vim.lsp.buf.add_workspace_folder(path)
+        end
+    end
     -- 2. Command
     local cmd = {
         JAVA_21_HOME .. "/bin/java",
@@ -86,9 +91,6 @@ function M.setup()
         settings = {
             java = {
                 eclipse = { downloadSources = true },
-                maven = { downloadSources = false }, -- Hybris typically doesn't use Maven for its core build
-                implementationsCodeLens = { enabled = true },
-                referencesCodeLens = { enabled = true },
                 configuration = {
                     runtimes = {
                         { name = "JavaSE-17", path = JAVA_17_HOME, default = true },
@@ -97,20 +99,23 @@ function M.setup()
                 },
             },
         },
-
         init_options = {
             bundles = {},
-            extendedClientCapabilities = { resolveAdditionalTextEditsSupport = true },
-            workspaceFolders = workspace_folders,
         },
         on_attach = function (client, bufnr)
-            log("JDTLS Client Attached. ID: " .. client.id .. ", Buffer: " .. bufnr)
-            vim.lsp.buf.add_workspace_folder(HYBRIS_ROOT) -- Add the main root first
-            vim.lsp.buf.add_workspace_folder(HYBRIS_ROOT .. "/bin/platform")
-            vim.lsp.buf.add_workspace_folder(HYBRIS_ROOT .. "/bin/modules")
-            vim.lsp.buf.add_workspace_folder(HYBRIS_ROOT .. "/bin/custom/trainingflexiblesearch")
-            vim.lsp.buf.add_workspace_folder(HYBRIS_ROOT .. "/bin/custom/dev")
+            log("JDTLS Client Attached. ID: " .. client.id)
+
+            -- DEBUG: Check if server acknowledged the folders
+            -- You can check the log to see if this prints true
+            local folders = client.workspace_folders
+            if folders then
+                log("Workspace folders loaded: " .. #folders)
+            else
+                log("No workspace folders detected by client.")
+            end
+            add_workspace_folder(project_paths)
         end
+
     }
 
     require("jdtls").start_or_attach(config)
