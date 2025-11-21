@@ -17,12 +17,11 @@ vim.lsp.config['lua_ls'] = {
     }
   }
 }
-
 vim.lsp.enable("lua_ls")
 
 vim.api.nvim_create_autocmd('FileType', {
     pattern = 'java',
-    callback = function(args)
+    callback = function()
         require'jdtls.jdtls_setup'.setup()
     end
 })
