@@ -4,9 +4,9 @@ local M = {}
 -- 1. CONFIGURATION CONSTANTS
 -- =============================================================================
 -- Custom file location TODO: need to update this so its loaded from .env
-local HYBRIS_ROOT = "/Users/manuel.perez02/Documents/cert/hybriscert/hybris"
-local JAVA_21_HOME = "/Users/manuel.perez02/.sdkman/candidates/java/21.0.9-sapmchn"
-
+--
+local HYBRIS_ROOT = vim.env.HYBRIS_HOME_DIR .. "/hybris"
+local JAVA_21_HOME = vim.env.JAVA_21_HOME
 -- JDTLS Paths
 local MASON_PATH = os.getenv("HOME") .. "/.local/share/nvim/mason/packages/jdtls"
 local JDTLS_JAR = vim.fn.glob(MASON_PATH .. "/plugins/org.eclipse.equinox.launcher_*.jar")
@@ -57,7 +57,6 @@ end
 -- 3. FILESYSTEM & PARSING
 -- =============================================================================
 
---- Locates an extension using Cache first, then 'find'
 local function resolve_extension_path_fs(ext_name)
     if PATH_CACHE[ext_name] then return PATH_CACHE[ext_name] end
 
@@ -107,7 +106,7 @@ local function get_local_extensions_map()
 
             local explicit_dir = line:match('<path%s+dir="([^"]+)"')
             if explicit_dir then
-                local full_path = explicit_dir:gsub("${HYBRIS_BIN_DIR}", HYBRIS_ROOT .. "/bin")
+                local full_path = HYBRIS_ROOT .. "/bin"
                 local derived_name = full_path:match("([^/]+)$")
                 active_map[derived_name] = full_path
                 PATH_CACHE[derived_name] = full_path
