@@ -17,3 +17,9 @@ vim.keymap.set("n", "N", "Nzzzv")
 vim.keymap.set("x", "<leader>p", "\"_dP")
 
 vim.keymap.set("v", "<leader>x", "\"_d")
+
+vim.keymap.set("n", "<leader>clr", function()
+    require'jdtls.jdtls_setup'.restore_backups()
+end, { desc = "Restore Hybris .classpath backups" })
+
+
