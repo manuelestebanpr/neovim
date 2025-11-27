@@ -9,13 +9,13 @@ return {
     },
     config = function()
       require("nvim-treesitter.configs").setup({
-        ignore_install = {"TSConfig"},
         sync_install = false,
         modules = {},
         highlight = {
           enable = true,
           additional_vim_regex_highlighting = false,
         },
+        ignore_install = {"php"},
         indent = { enable = true },
         auto_install = false,
         ensure_installed = {
@@ -44,17 +44,8 @@ return {
           "gosum",
           "svelte",
           "java",
+          "xml",
           "zig",
-
-        },
-        incremental_selection = {
-          enable = true,
-          keymaps = {
-            init_selection = "<leader>vv",
-            node_incremental = "+",
-            scope_incremental = false,
-            node_decremental = "_",
-          },
         },
       })
     end,

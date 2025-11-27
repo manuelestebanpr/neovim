@@ -61,3 +61,4 @@ cmp.setup.cmdline(':', {
 
 -- Set up lsp.
 require('cmp_nvim_lsp').default_capabilities()
+
