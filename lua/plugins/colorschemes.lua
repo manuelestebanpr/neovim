@@ -4,7 +4,6 @@
     enabled = true,
          config = function()
              require('kanagawa').setup({
-                 -- ... your other config
                  overrides = function()
                      return {
 
