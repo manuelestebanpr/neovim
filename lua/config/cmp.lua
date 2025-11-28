@@ -25,7 +25,6 @@ cmp.setup({
         -- Scroll up and down in the completion documentation
         ['<C-u>'] = cmp.mapping.scroll_docs(-4),
         ['<C-d>'] = cmp.mapping.scroll_docs(4),
-
     }),
     sources = cmp.config.sources({
             { name = 'nvim_lsp' },
@@ -48,17 +47,19 @@ cmp.setup.cmdline({ '/', '?' }, {
     }
 })
 
--- Use cmdline & path source for ':' (if you enabled `native_menu`, this won't work anymore).
 cmp.setup.cmdline(':', {
     mapping = cmp.mapping.preset.cmdline(),
     sources = cmp.config.sources({
         { name = 'path' }
     }, {
-        { name = 'cmdline' }
-    }),
-    matching = { disallow_symbol_nonprefix_matching = false }
+            {
+                name = 'cmdline',
+                option = {
+                    ignore_cmds = { 'Man', '!' }
+                }
+            }
+        })
 })
-
 -- Set up lsp.
 require('cmp_nvim_lsp').default_capabilities()
 

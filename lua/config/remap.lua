@@ -41,7 +41,7 @@ vim.keymap.set("v", "<leader>ps", function()
 end, { desc = "Grep Selected Text" })
 
 vim.keymap.set("n", "<leader>ps", function()
-     require('fzf-lua').live_grep()
+    require('fzf-lua').live_grep()
 end, {desc = "Grep Search Text"})
 
 vim.keymap.set("n", "<leader>psf", function()

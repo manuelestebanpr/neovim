@@ -12,8 +12,6 @@ vim.lsp.config['lua_ls'] = {
         }
     }
 }
-vim.lsp.enable("lua_ls")
-
 
 -- This is done mainly for xml on sap commerce projects, Not sure how it works on other xml. 
 vim.lsp.config['lemminx'] = {
