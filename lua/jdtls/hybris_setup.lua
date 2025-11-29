@@ -17,36 +17,17 @@ local CONF = {
 
 -- Computed Paths
 CONF.JDTLS_JAR = vim.fn.glob(CONF.MASON_PATH .. "/plugins/org.eclipse.equinox.launcher_*.jar")
-CONF.CONFIG_PATH = CONF.MASON_PATH .. "/config_mac" -- Change to config_linux if on Linux
+CONF.CONFIG_PATH = CONF.MASON_PATH .. "/config_mac"
 
 -- Global Cache
 local CACHE = {
     scanned = false,
-    workspace_folders = {}, -- List of "file://..." strings
-    extension_map = {},     -- name -> path string
+    workspace_folders = {},
+    extension_map = {},
 }
 
 -- Shutdown Timer Storage
 local shutdown_timer = nil
-
--- =============================================================================
--- 2. LOGGING & UTILS
--- =============================================================================
-
-local function log(msg)
-    local f = io.open(CONF.LOG_FILE, "a")
-    if f then
-        f:write(string.format("[%s] %s\n", os.date("%Y-%m-%dT%H:%M:%S"), msg))
-        f:close()
-    end
-end
-
-local function copy_file(src, dest)
-    local content = vim.fn.readfile(src)
-    if vim.fn.writefile(content, dest) == 0 then return true end
-    return false
-end
-
 -- =============================================================================
 -- 3. PERFORMANCE SCANNER (PLATFORM + MODULES + CUSTOM)
 -- =============================================================================
@@ -58,7 +39,7 @@ end
 local function load_hybris_ecosystem()
     if CACHE.scanned then return end
 
-    log("Starting Full Hybris Ecosystem Scan...")
+    vim.notify("Starting Full Hybris Ecosystem Scan...")
 
     -- 1. Add Platform (Manually)
     local platform_path = CONF.HYBRIS_ROOT .. "/bin/platform"
@@ -97,7 +78,7 @@ local function load_hybris_ecosystem()
     fast_scan(CONF.HYBRIS_ROOT .. "/bin/modules", 4)
 
     CACHE.scanned = true
-    log(string.format("Scan Complete. Loaded %d extensions.", #CACHE.workspace_folders))
+    vim.notify(string.format("Scan Complete. Loaded %d extensions.", #CACHE.workspace_folders))
 end
 
 -- =============================================================================
@@ -176,7 +157,7 @@ local function inject_classpath(target_path)
 
     if injected then
         vim.fn.writefile(new_lines, classpath_file)
-        log("Injected dependencies for: " .. ext_name)
+        vim.notify("Injected dependencies for: " .. ext_name)
     end
 end
 
@@ -204,7 +185,7 @@ local function setup_autoshutdown(client_id)
             if attached_buffers <= 1 then -- <= 1 because the current one is detaching
                 if shutdown_timer then shutdown_timer:stop() end
 
-                log("No active buffers. Starting 20s shutdown timer...")
+                vim.notify("No active buffers. Starting 20s shutdown timer...")
                 shutdown_timer = vim.defer_fn(function()
                     -- Re-check just in case user opened a file quickly
                     local still_attached = 0
@@ -215,10 +196,10 @@ local function setup_autoshutdown(client_id)
                     end
 
                     if still_attached == 0 then
-                        log("Timeout reached. Stopping JDTLS.")
+                        vim.notify("Timeout reached. Stopping JDTLS.")
                         client.stop(client, true)
                     else
-                        log("Shutdown aborted. New buffer attached.")
+                        vim.notify("Shutdown aborted. New buffer attached.")
                     end
                 end, 20000) -- 20 seconds
             end
@@ -229,7 +210,7 @@ local function setup_autoshutdown(client_id)
         callback = function(args)
             if args.data.client_id == client_id then
                 if shutdown_timer then
-                    log("Buffer attached. Cancelling shutdown timer.")
+                    vim.notify("Buffer attached. Cancelling shutdown timer.")
                     shutdown_timer:stop()
                     shutdown_timer = nil
                 end
@@ -306,7 +287,7 @@ function M.setup()
     if not current_ext_path then
         if current_buf_name:find(CONF.HYBRIS_ROOT, 1, true) then
             -- Valid hybris file, but maybe in config folder or root
-            log("File in Hybris root/config, generic attach.")
+            vim.notify("File in Hybris root/config, generic attach.")
         else
             return -- Not a hybris file
         end
@@ -371,8 +352,7 @@ function M.setup()
         },
 
         on_attach = function(client, bufnr)
-            log("Attached to buffer: " .. vim.api.nvim_buf_get_name(bufnr))
-            -- Setup Shutdown Logic
+            vim.notify("Attached to buffer: " .. vim.api.nvim_buf_get_name(bufnr))
             setup_autoshutdown(client.id)
         end
     })

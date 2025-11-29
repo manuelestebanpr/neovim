@@ -1,7 +1,24 @@
 vim.g.mapleader = " "
 
+vim.keymap.set("n", "<leader>w", function()
+    local success, err = pcall(function()
+        vim.cmd("silent! write")
+    end)
+
+    if not success then
+        vim.notify("Error saving file: " .. tostring(err), vim.log.levels.ERROR)
+        return
+    end
+
+    local file_name = vim.fn.expand("%:t")
+    local size = vim.fn.getfsize(vim.fn.expand("%"))
+    if size < 0 then size = 0 end
+
+    local msg = string.format('"%s" %dB written', file_name, size)
+    vim.notify(msg, vim.log.levels.INFO, { title = "File Saved" })
+end)
+
 vim.keymap.set("n", "<leader>pv", vim.cmd.Ex)
-vim.keymap.set("n", "<leader>w", vim.cmd.write)
 vim.keymap.set("n", "<leader>sn", "<cmd>nohlsearch<CR>", { desc = "Clear search highlights" })
 
 
@@ -19,26 +36,6 @@ vim.keymap.set("v", "<leader>x", "\"_d")
 vim.keymap.set("n", "<leader>clr", function()
     require'jdtls.hybris_setup'.restore_backups()
 end, { desc = "Restore Hybris .classpath backups" })
-
--- Grep keybinding for visual mode -
-vim.keymap.set("v", "<leader>ps", function()
-    local saved_reg = vim.fn.getreg("v")
-    local saved_type = vim.fn.getregtype("v")
-
-    vim.cmd('noau normal! "vy')
-
-    local selected_text = vim.fn.getreg("v")
-
-    vim.fn.setreg("v", saved_reg, saved_type)
-
-    if not selected_text or #selected_text == 0 then
-        return
-    end
-    selected_text = string.gsub(selected_text, "\n", " ")
-    selected_text = vim.fn.escape(selected_text, "\\.*+?^$()[]{}|")
-
-    require('fzf-lua').live_grep({ search = selected_text })
-end, { desc = "Grep Selected Text" })
 
 vim.keymap.set("n", "<leader>ps", function()
     require('fzf-lua').live_grep()
