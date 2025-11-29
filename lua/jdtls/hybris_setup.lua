@@ -3,7 +3,6 @@
 -- =============================================================================
 
 local CONF = {
-    -- Environment Variables
     HYBRIS_ROOT = vim.env.HYBRIS_HOME_DIR and (vim.env.HYBRIS_HOME_DIR .. "/hybris") or nil,
     JAVA_HOME = vim.env.JAVA_21_HOME,
 
@@ -19,14 +18,12 @@ local CONF = {
 CONF.JDTLS_JAR = vim.fn.glob(CONF.MASON_PATH .. "/plugins/org.eclipse.equinox.launcher_*.jar")
 CONF.CONFIG_PATH = CONF.MASON_PATH .. "/config_mac"
 
--- Global Cache
 local CACHE = {
     scanned = false,
     workspace_folders = {},
     extension_map = {},
 }
 
--- Shutdown Timer Storage
 local shutdown_timer = nil
 -- =============================================================================
 -- 3. PERFORMANCE SCANNER (PLATFORM + MODULES + CUSTOM)
@@ -51,10 +48,8 @@ local function load_hybris_ecosystem()
     -- 2. Fast Scan Function (using system find for speed on huge dirs)
     local function fast_scan(base_path, depth)
         if vim.fn.isdirectory(base_path) == 0 then return end
-
-        -- Optimizing find: exclude .git, exclude resources, look only for directory containing extensioninfo.xml
         local cmd = string.format(
-            "find %s -maxdepth %d -type f -name 'extensioninfo.xml' -print", 
+            "fd %s -maxdepth %d -type f -name 'extensioninfo.xml' -print",
             base_path, depth
         )
 

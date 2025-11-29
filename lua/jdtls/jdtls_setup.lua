@@ -11,7 +11,7 @@ local CONF = {
 
   local mason_path = vim.fn.stdpath("data") .. "/mason/packages/jdtls"
   local launcher_jar = vim.fn.glob(mason_path .. "/plugins/org.eclipse.equinox.launcher_*.jar")
-  local config_path = mason_path .. "/config_mac" 
+  local config_path = mason_path .. "/config_mac"
 
   local project_name = vim.fn.fnamemodify(vim.fn.getcwd(), ':p:h:t')
   local workspace_dir = os.getenv("HOME") .. "/.cache/jdtls/workspace/" .. project_name
@@ -19,7 +19,6 @@ local CONF = {
   -- =============================================================================
   -- 2. JDTLS CONFIGURATION
   -- =============================================================================
-  
   local config = {
     cmd = {
       CONF.JAVA_HOME .. "/bin/java",
@@ -32,11 +31,9 @@ local CONF = {
       "--add-modules=ALL-SYSTEM",
       "--add-opens", "java.base/java.util=ALL-UNNAMED",
       "--add-opens", "java.base/java.lang=ALL-UNNAMED",
-      
       -- Mason Paths
       "-jar", launcher_jar,
       "-configuration", config_path,
-      
       -- Workspace Data
       "-data", workspace_dir
     },
@@ -52,13 +49,12 @@ local CONF = {
       }
     },
 
-    on_attach = function(client, bufnr)
+    on_attach = function(client)
       local msg = string.format(
         "Client ID: %s\nRoot: %s",
         client.id,
         client.config.root_dir
       )
-      
       vim.notify(msg, vim.log.levels.INFO, {
         title = "JDTLS Attached",
         timeout = 3000
