@@ -47,16 +47,21 @@ end, {desc = "Grep Search Files"})
 
 vim.keymap.set("n", "<leader>psg", function()
     require('fzf-lua').git_commits()
-end, {desc = "Grep Search Files"})
+end, {desc = "Grep Search Commits"})
 
 vim.keymap.set("n", "<leader>psb", function()
     require('fzf-lua').git_branches()
 end, {desc = "Grep Search Files"})
 
 vim.api.nvim_create_autocmd('FileType', {
-    pattern = 'java',
-    callback = function()
-        require'jdtls.hybris_setup'.setup()
-    end
-})
+  pattern = 'java',
+  callback = function()
+    local dirname = vim.fn.fnamemodify(vim.fn.getcwd(), ':t')
 
+    if dirname == 'hybris' then
+      require('jdtls.hybris_setup').setup()
+    else
+      require('jdtls.jdtls_setup').setup()
+    end
+  end
+})

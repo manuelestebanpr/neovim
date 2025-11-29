@@ -1,9 +1,9 @@
-local cmp = require 'cmp'
+local cmp = require('cmp')
 
 cmp.setup({
     snippet = {
         expand = function(args)
-            vim.snippet.expand(args.body) -- For native neovim snippets (Neovim v0.10+)
+            vim.snippet.expand(args.body)
         end,
     },
     window = {
@@ -11,55 +11,73 @@ cmp.setup({
         documentation = cmp.config.window.bordered(),
     },
     mapping = cmp.mapping.preset.insert({
-        -- Navigate between completion items
         ['<C-k>'] = cmp.mapping.select_prev_item({ behavior = 'select' }),
         ['<C-j>'] = cmp.mapping.select_next_item({ behavior = 'select' }),
-
-        -- `Enter` key to confirm completion
-        ['<Tab>'] = cmp.mapping.confirm({ select = false }),
+        ['<Tab>'] = cmp.mapping.confirm({ select = false }), -- Recommended: set select to false for Tab
         ['<C-a>'] = cmp.mapping.abort(),
-
-        -- Ctrl+Space to trigger completion menu
         ['<C-Space>'] = cmp.mapping.complete(),
-
-        -- Scroll up and down in the completion documentation
         ['<C-u>'] = cmp.mapping.scroll_docs(-4),
         ['<C-d>'] = cmp.mapping.scroll_docs(4),
     }),
     sources = cmp.config.sources({
-            { name = 'nvim_lsp' },
-
-        },
-        {
-            { name = 'buffer' },
-        }),
-    preselect = 'item',
+        { name = 'nvim_lsp' },
+    }, {
+        { name = 'buffer' },
+    }),
+    preselect = 'item', 
     completion = {
         completeopt = 'menu,menuone,noinsert'
     },
 })
 
--- Use buffer source for `/` and `?` (if you enabled `native_menu`, this won't work anymore).
+-- 3. Command Line Setup (Search / and ?)
 cmp.setup.cmdline({ '/', '?' }, {
-    mapping = cmp.mapping.preset.cmdline(),
     sources = {
         { name = 'buffer' }
     }
 })
 
 cmp.setup.cmdline(':', {
-    mapping = cmp.mapping.preset.cmdline(),
+    mapping = cmp.mapping.preset.cmdline({
+        ['<Tab>'] = {
+            c = function()
+                if cmp.visible() then
+                    cmp.confirm({ select = false })
+                else
+                    cmp.complete()
+                end
+            end,
+        },
+        ['<C-j>'] = {
+            c = function(fallback)
+                if cmp.visible() then
+                    cmp.select_next_item()
+                else
+                    fallback()
+                end
+            end,
+        },
+        ['<C-k>'] = {
+            c = function(fallback)
+                if cmp.visible() then
+                    cmp.select_prev_item()
+                else
+                    fallback()
+                end
+            end,
+        },
+        ['<C-e>'] = {
+            c = cmp.mapping.abort(),
+        },
+    }),
     sources = cmp.config.sources({
         { name = 'path' }
     }, {
-            {
-                name = 'cmdline',
-                option = {
-                    ignore_cmds = { 'Man', '!' }
-                }
+        {
+            name = 'cmdline',
+            option = {
+                ignore_cmds = { 'Man', '!' }
             }
-        })
+        }
+    })
 })
--- Set up lsp.
-require('cmp_nvim_lsp').default_capabilities()
-
