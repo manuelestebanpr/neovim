@@ -67,7 +67,7 @@ local function resolve_dependencies_recursive(ext_name, accumulated_deps)
 
   local ext_path = STATE.name_to_path[ext_name]
   if not ext_path then
-    if ext_name == "platform" then 
+    if ext_name == "platform" then
       ext_path = CONF.HYBRIS_ROOT .. "/bin/platform"
     else
       return
@@ -193,7 +193,7 @@ local function prepare_workspace()
 
       -- 1. Recursively find deps for THIS specific extension
       -- We pass a fresh table `extension_specific_deps` to capture the full tree for THIS extension
-      local extension_specific_deps = {} 
+      local extension_specific_deps = {}
       resolve_dependencies_recursive(ext_name, extension_specific_deps)
 
       -- 2. Update .classpath with the full list (children + grandchildren)
@@ -207,9 +207,9 @@ end
 -- =============================================================================
 
 function M.setup()
-  if not CONF.HYBRIS_ROOT then 
-    vim.notify("HYBRIS_HOME_DIR not set", vim.log.levels.ERROR) 
-    return 
+  if not CONF.HYBRIS_ROOT then
+    vim.notify("HYBRIS_HOME_DIR not set", vim.log.levels.ERROR)
+    return
   end
 
   prepare_workspace()
@@ -248,9 +248,7 @@ function M.setup()
             "**/node_modules/**",
             "**/.git/**",
             "**/bower_components/**",
-            "**/dist/**",
-            "**/tmp/**",
-            "**/jalo/**"
+            "**/dist/**"
           },
         },
         configuration = {
@@ -267,7 +265,7 @@ function M.setup()
             ["**/bower_components"] = true,
             ["**/dist"] = true,
             ["**/tmp"] = true,
-            ["**/.classpath.nvim_bak"] = true 
+            ["**/.classpath.nvim_bak"] = true
           }
         }
       })
@@ -285,5 +283,17 @@ function M.restore_backups()
   end
   vim.notify("Restored all .classpath files.", vim.log.levels.INFO)
 end
+
+local opts = { noremap = true, silent = true }
+vim.api.nvim_set_keymap('n', 'gD' , '<cmd>lua vim.lsp.buf.declaration()<CR>', opts)
+vim.api.nvim_set_keymap('n', 'gd' , '<cmd>lua vim.lsp.buf.definition()<CR>', opts)
+vim.api.nvim_set_keymap('n', 'gi' , '<cmd>lua vim.lsp.buf.implementation()<CR>', opts)
+
+vim.keymap.set('n', 'gr', function()
+  require('fzf-lua').lsp_references({
+    jump1 = true,
+    ignore_current_line = true,
+  })
+end, { desc = "FZF LSP References", silent = true })
 
 return M
