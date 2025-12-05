@@ -16,6 +16,13 @@ local CONF = {
   JDTLS_JAR = vim.fn.glob(vim.env.MASON_PATH .. "/plugins/org.eclipse.equinox.launcher_*.jar"),
 }
 
+local REAL_CUSTOM_PATH = nil
+if CONF.HYBRIS_ROOT then
+  local logical_custom = CONF.HYBRIS_ROOT .. "/bin/custom"
+  local resolved = vim.fn.resolve(logical_custom)
+  REAL_CUSTOM_PATH = vim.fn.fnamemodify(resolved, ":p"):gsub("/+$", "")
+end
+
 local STATE = {
   name_to_path = {},
   workspace_folders = {},
@@ -38,18 +45,15 @@ end
 -- 3. XML PARSING & DEPENDENCIES
 -- =============================================================================
 
+-- Parses extensioninfo.xml to find <requires-extension> entries
 local function get_dependencies(ext_path)
   local xml_path = ext_path .. "/extensioninfo.xml"
   local content = read_file_content(xml_path)
   if not content then return {} end
 
-  -- 1. Sanitize Comments (Handle multi-line comments safely)
-  -- We remove anything between non-greedily
-  content = content:gsub("<!%-%-(.-)%-%->", "")
+  content = content:gsub("<!%-%-(.-)%-%->", "") -- Remove comments safely
 
-  -- 2. Extract Requires
   local deps = {}
-  -- Pattern matches <requires-extension ... name="VALUE" ... >
   for name in content:gmatch('<requires%-extension[^>]-name=["\']([^"\']+)["\']') do
     table.insert(deps, name)
   end
@@ -57,39 +61,29 @@ local function get_dependencies(ext_path)
   return deps
 end
 
--- Resolve dependencies recursively.
--- IMPORTANT: This function now serves two purposes:
--- 1. Populates STATE.workspace_folders (so JDTLS knows where the code is).
--- 2. Returns a Set (table) of ALL transitive dependencies for the caller.
+-- Recursively resolves deps: populates workspace (global) and dependency tree (local)
 local function resolve_dependencies_recursive(ext_name, accumulated_deps)
-  -- If we've already processed this extension for the global workspace list, we still
-  -- might need to return its dependencies for the current caller's classpath.
-
   local ext_path = STATE.name_to_path[ext_name]
-  if not ext_path then
-    if ext_name == "platform" then
-      ext_path = CONF.HYBRIS_ROOT .. "/bin/platform"
-    else
-      return
-    end
+
+  -- Handle platform special case if path not found in map
+  if not ext_path and ext_name == "platform" then
+    ext_path = CONF.HYBRIS_ROOT .. "/bin/platform"
   end
 
-  -- Add to Global Workspace (if not already there)
-  -- We use a separate check because STATE.processed_exts is global context
+  if not ext_path then return end
+
+  -- [Requirement 1 & 2] If this ext isn't in workspace yet, add it now
   if not STATE.processed_exts[ext_name] then
     STATE.processed_exts[ext_name] = true
     table.insert(STATE.workspace_folders, "file://" .. ext_path)
   end
 
-  -- Get immediate deps
+  -- Traverse dependencies regardless of workspace state to build full tree
   local immediate_deps = get_dependencies(ext_path)
 
   for _, dep_name in ipairs(immediate_deps) do
-    -- If we haven't seen this dependency in the current recursion chain:
     if not accumulated_deps[dep_name] then
-      accumulated_deps[dep_name] = true
-
-      -- Recurse: Go deeper to find the grandchildren
+      accumulated_deps[dep_name] = true -- Mark visited for this recursion chain
       resolve_dependencies_recursive(dep_name, accumulated_deps)
     end
   end
@@ -103,8 +97,12 @@ local function update_classpath(ext_name, dependencies)
   local ext_path = STATE.name_to_path[ext_name]
   if not ext_path then return end
 
-  -- STRICT CHECK: Only update Custom extensions. 
-  if not ext_path:find("/bin/custom") then return end
+  --  Standard: Path contains "/bin/custom/" anywhere
+  --  Linked: Path matches the resolved physical custom path
+  local is_standard_custom = ext_path:find("/bin/custom/", 1, true)
+  local is_linked_custom = REAL_CUSTOM_PATH and ext_path:find(REAL_CUSTOM_PATH, 1, true)
+
+  if not (is_standard_custom or is_linked_custom) then return end
 
   local classpath_file = ext_path .. "/.classpath"
   if vim.fn.filereadable(classpath_file) == 0 then return end
@@ -125,13 +123,8 @@ local function update_classpath(ext_name, dependencies)
   -- 3. Prepare entries
   local entries_to_add = {}
   for dep_name, _ in pairs(dependencies) do
-    -- Filter out self, platform (usually implicit or handled via container), and broken links
     if dep_name ~= ext_name and dep_name ~= "platform" then
-
       local entry_str = string.format('\t<classpathentry exported="false" kind="src" path="/%s" />', dep_name)
-
-      -- Check if entry already exists (string match)
-      -- We use plain matching to avoid regex special char issues with paths
       if not string.find(file_content_str, 'path="/' .. dep_name .. '"', 1, true) then
         table.insert(entries_to_add, entry_str)
       end
@@ -164,13 +157,16 @@ end
 -- =============================================================================
 
 local function prepare_workspace()
-  vim.notify("Building Extension Map...", vim.log.levels.INFO)
+  vim.notify("Building Extension Map & Resolving Workspace...", vim.log.levels.INFO)
 
-  -- Reset State on reload
+  -- Reset State
   STATE.workspace_folders = {}
   STATE.processed_exts = {}
+  STATE.name_to_path = {}
 
-  local cmd = string.format("fd -t f -F 'extensioninfo.xml' --absolute-path . %s/bin", CONF.HYBRIS_ROOT)
+  -- 1. Build Global Map: Find ALL extensions in /bin (recursively)
+  -- This creates a master list of every available extension in the system.
+  local cmd = string.format("fd -L -t f -F 'extensioninfo.xml' --absolute-path . %s/bin", CONF.HYBRIS_ROOT)
   local results = vim.fn.systemlist(cmd)
 
   for _, xml_path in ipairs(results) do
@@ -179,25 +175,43 @@ local function prepare_workspace()
     STATE.name_to_path[ext_name] = ext_path
   end
 
-  -- Ensure Platform is in workspace
-  resolve_dependencies_recursive("platform", {})
+  -- 2. PASS 1: Force Load ALL Custom Extensions & Inject Classpaths
+  -- We iterate the map first to ensure everything in /custom/ is added to the workspace,
+  -- regardless of whether it appears in localextensions.xml.
+  vim.notify("Scanning and Injecting Classpaths for ALL Custom Extensions...", vim.log.levels.INFO)
 
-  -- Read localextensions.xml
-  local local_ext_path = CONF.HYBRIS_ROOT .. "/config/localextensions.xml"
+  for name, path in pairs(STATE.name_to_path) do
+    local is_standard_custom = path:find("/bin/custom/", 1, true)
+    local is_linked_custom = REAL_CUSTOM_PATH and path:find(REAL_CUSTOM_PATH, 1, true)
+
+    if is_standard_custom or is_linked_custom then
+      -- 1. Calculate dependencies specifically for this extension
+      local custom_deps = {} 
+
+      -- 2. Add to workspace (and recursive dependencies) if not already present
+      resolve_dependencies_recursive(name, custom_deps)
+
+      -- 3. Update the .classpath file
+      update_classpath(name, custom_deps)
+    end
+  end
+
+  -- 3. PASS 2: Fill gaps using localextensions.xml
+  -- This catches platform extensions or standard modules (like smartedit, solr) 
+  -- that are enabled but live outside /custom/.
+  resolve_dependencies_recursive("platform", {}) 
+
+  local logical_config = CONF.HYBRIS_ROOT .. "/config"
+  local resolved_config = vim.fn.resolve(logical_config)
+  local local_ext_path = resolved_config .. "/localextensions.xml"
+
   local content = read_file_content(local_ext_path)
-
   if content then
-    content = content:gsub("<!%-%-(.-)%-%->", "") -- Remove comments
-
+    content = content:gsub("<!%-%-(.-)%-%->", "")
     for ext_name in content:gmatch('<extension[^>]-name=["\']([^"\']+)["\']') do
-
-      -- 1. Recursively find deps for THIS specific extension
-      -- We pass a fresh table `extension_specific_deps` to capture the full tree for THIS extension
-      local extension_specific_deps = {}
-      resolve_dependencies_recursive(ext_name, extension_specific_deps)
-
-      -- 2. Update .classpath with the full list (children + grandchildren)
-      update_classpath(ext_name, extension_specific_deps)
+      -- If the custom extension loop (Pass 1) already added this, 
+      -- STATE.processed_exts will prevent duplicates efficiently.
+      resolve_dependencies_recursive(ext_name, {})
     end
   end
 end
@@ -275,7 +289,7 @@ function M.setup()
 end
 
 function M.restore_backups()
-  local cmd = string.format("fd -H -t f '.classpath.nvim_bak$' --absolute-path %s", CONF.HYBRIS_ROOT)
+  local cmd = string.format("fd -L -H -t f '.classpath.nvim_bak$' --absolute-path %s", CONF.HYBRIS_ROOT)
   local backups = vim.fn.systemlist(cmd)
   for _, bak in ipairs(backups) do
     local original = bak:gsub("%.nvim_bak$", "")
