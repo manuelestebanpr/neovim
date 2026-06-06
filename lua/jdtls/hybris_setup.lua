@@ -1,26 +1,49 @@
 local M = {}
 local jdtls = require('jdtls')
+local utils = require('jdtls.utils')
 
 -- =============================================================================
 -- 1. CONFIGURATION
 -- =============================================================================
 
-local hybris_home = vim.env.HYBRIS_HOME_DIR
-local hybris_dir_name = hybris_home and vim.fn.fnamemodify(hybris_home, ":t") or "hybris_project"
-
-local CONF = {
-  HYBRIS_ROOT = hybris_home and (hybris_home .. "/hybris") or nil,
-  JAVA_HOME = vim.env.JAVA_21_HOME,
-  WORKSPACE_DATA = os.getenv("HOME") .. "/.local/share/nvim/sapcommerce/" .. hybris_dir_name,
-  CONFIG_PATH = vim.env.MASON_PATH .. "/config_mac",
-  JDTLS_JAR = vim.fn.glob(vim.env.MASON_PATH .. "/plugins/org.eclipse.equinox.launcher_*.jar"),
-}
-
+local CONF = {}
 local REAL_CUSTOM_PATH = nil
-if CONF.HYBRIS_ROOT then
+
+local function init_paths(hybris_root)
+  if CONF.HYBRIS_ROOT then return end
+
+  if not hybris_root then
+    local env_root = vim.env.HYBRIS_HOME_DIR
+    if env_root then
+      hybris_root = env_root .. "/hybris"
+    else
+      local _, root = utils.detect_project()
+      hybris_root = root
+    end
+  end
+
+  CONF.HYBRIS_ROOT = hybris_root
+
+  local hybris_dir_name = vim.fn.fnamemodify(CONF.HYBRIS_ROOT, ":h:t")
+  if hybris_dir_name == "" or hybris_dir_name == "/" then
+    hybris_dir_name = "hybris_project"
+  end
+
+  local paths = utils.get_jdtls_paths()
+
+  CONF.JAVA_CMD = utils.get_java_cmd()
+  CONF.JAVA_HOME = vim.env.JAVA_21_HOME or vim.env.JAVA_HOME or "/usr/lib/jvm/java-21-openjdk"
+  CONF.WORKSPACE_DATA = os.getenv("HOME") .. "/.local/share/nvim/sapcommerce/" .. hybris_dir_name
+  CONF.CONFIG_PATH = paths.config
+  CONF.JDTLS_JAR = paths.launcher
+
   local logical_custom = CONF.HYBRIS_ROOT .. "/bin/custom"
-  local resolved = vim.fn.resolve(logical_custom)
-  REAL_CUSTOM_PATH = vim.fn.fnamemodify(resolved, ":p"):gsub("/+$", "")
+  if vim.fn.isdirectory(logical_custom) == 1 then
+    local resolved = vim.fn.resolve(logical_custom)
+    REAL_CUSTOM_PATH = vim.fn.fnamemodify(resolved, ":p"):gsub("/+$", "")
+  else
+    REAL_CUSTOM_PATH = nil
+  end
 end
 
 local STATE = {
@@ -220,31 +243,52 @@ end
 -- 6. SETUP
 -- =============================================================================
 
-function M.setup()
-  if not CONF.HYBRIS_ROOT then
-    vim.notify("HYBRIS_HOME_DIR not set", vim.log.levels.ERROR)
+function M.setup(detected_root)
+  init_paths(detected_root)
+
+  if not CONF.HYBRIS_ROOT or vim.fn.isdirectory(CONF.HYBRIS_ROOT .. "/bin/platform") == 0 then
+    vim.notify("Could not resolve a valid Hybris root directory. Ensure you are in a Hybris project.", vim.log.levels.ERROR, { title = "JDTLS Hybris Setup Error" })
+    return
+  end
+
+  if not CONF.JDTLS_JAR or CONF.JDTLS_JAR == "" then
+    vim.notify("JDTLS launcher JAR not found. Please install jdtls via Mason (:MasonInstall jdtls) or check your system installation.", vim.log.levels.ERROR, { title = "JDTLS Setup Error" })
     return
   end
 
   prepare_workspace()
 
+  local cmd = {
+    CONF.JAVA_CMD,
+    "-Declipse.application=org.eclipse.jdt.ls.core.id1",
+    "-Dosgi.bundles.defaultStartLevel=4",
+    "-Declipse.product=org.eclipse.jdt.ls.core.product",
+    "-Dlog.protocol=true",
+    "-Dlog.level=ALL",
+    "-Xmx4g",
+    "-XX:+UseG1GC",
+    "-Djava.import.generatesMetadataFilesAtProjectRoot=false",
+  }
+
+  local lombok_jar = utils.get_lombok_jar(CONF.JDTLS_JAR and vim.fn.fnamemodify(CONF.JDTLS_JAR, ":h:h"))
+  if lombok_jar then
+    table.insert(cmd, "-javaagent:" .. lombok_jar)
+  end
+
+  table.insert(cmd, "--add-modules=ALL-SYSTEM")
+  table.insert(cmd, "--add-opens")
+  table.insert(cmd, "java.base/java.util=ALL-UNNAMED")
+  table.insert(cmd, "--add-opens")
+  table.insert(cmd, "java.base/java.lang=ALL-UNNAMED")
+  table.insert(cmd, "-jar")
+  table.insert(cmd, CONF.JDTLS_JAR)
+  table.insert(cmd, "-configuration")
+  table.insert(cmd, CONF.CONFIG_PATH)
+  table.insert(cmd, "-data")
+  table.insert(cmd, CONF.WORKSPACE_DATA)
+
   jdtls.start_or_attach({
-    cmd = {
-      CONF.JAVA_HOME .. "/bin/java",
-      "-Declipse.application=org.eclipse.jdt.ls.core.id1",
-      "-Dosgi.bundles.defaultStartLevel=4",
-      "-Declipse.product=org.eclipse.jdt.ls.core.product",
-      "-Dlog.protocol=true",
-      "-Dlog.level=ALL",
-      "-Xmx4g",
-      "-XX:+UseG1GC",
-      "--add-modules=ALL-SYSTEM",
-      "--add-opens", "java.base/java.util=ALL-UNNAMED",
-      "--add-opens", "java.base/java.lang=ALL-UNNAMED",
-      "-jar", CONF.JDTLS_JAR,
-      "-configuration", CONF.CONFIG_PATH,
-      "-data", CONF.WORKSPACE_DATA,
-    },
+    cmd = cmd,
     root_dir = CONF.HYBRIS_ROOT,
     init_options = {
       bundles = {},
@@ -270,7 +314,10 @@ function M.setup()
         }
       }
     },
-    on_attach = function(client, _)
+    on_attach = function(client, bufnr)
+      -- Bind keymaps and code actions buffer-locally
+      utils.setup_keymaps(bufnr)
+
       client.config.settings = vim.tbl_deep_extend('force', client.config.settings, {
         files = {
           exclude = {
@@ -283,31 +330,28 @@ function M.setup()
           }
         }
       })
-      client.notify("JDTLS Attached. Workspace size: " .. #STATE.workspace_folders, vim.log.levels.INFO)
+      vim.notify("JDTLS Attached (Hybris). Workspace size: " .. #STATE.workspace_folders, vim.log.levels.INFO)
     end
   })
 end
 
 function M.restore_backups()
+  init_paths()
+  if not CONF.HYBRIS_ROOT or vim.fn.isdirectory(CONF.HYBRIS_ROOT .. "/bin/platform") == 0 then
+    vim.notify("Could not resolve Hybris root directory. Ensure you are in a Hybris project.", vim.log.levels.ERROR)
+    return
+  end
   local cmd = string.format("fd -L -H -t f '.classpath.nvim_bak$' --absolute-path %s", CONF.HYBRIS_ROOT)
   local backups = vim.fn.systemlist(cmd)
+  if #backups == 0 then
+    vim.notify("No .classpath backups found to restore.", vim.log.levels.INFO)
+    return
+  end
   for _, bak in ipairs(backups) do
     local original = bak:gsub("%.nvim_bak$", "")
     vim.fn.rename(bak, original)
   end
   vim.notify("Restored all .classpath files.", vim.log.levels.INFO)
 end
-
-local opts = { noremap = true, silent = true }
-vim.api.nvim_set_keymap('n', 'gD' , '<cmd>lua vim.lsp.buf.declaration()<CR>', opts)
-vim.api.nvim_set_keymap('n', 'gd' , '<cmd>lua vim.lsp.buf.definition()<CR>', opts)
-vim.api.nvim_set_keymap('n', 'gi' , '<cmd>lua vim.lsp.buf.implementation()<CR>', opts)
-
-vim.keymap.set('n', 'gr', function()
-  require('fzf-lua').lsp_references({
-    jump1 = true,
-    ignore_current_line = true,
-  })
-end, { desc = "FZF LSP References", silent = true })
 
 return M

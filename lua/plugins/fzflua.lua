@@ -1,3 +1,48 @@
+-- Helper to dynamically detect fzf version and apply compatible flags
+local fzf_opts = {}
+local cache_path = vim.fn.stdpath("cache") .. "/fzf_version_cache"
+local version_num
+
+-- Try reading from cache
+local f = io.open(cache_path, "r")
+if f then
+  local cached_ver = f:read("*all")
+  f:close()
+  version_num = tonumber(cached_ver)
+end
+
+-- If cache doesn't exist, run the system command and save it
+if not version_num then
+  local fzf_version_raw = vim.fn.system("fzf --version")
+  if vim.v.shell_error == 0 then
+    local major, minor = fzf_version_raw:match("(%d+)%.(%d+)")
+    if major and minor then
+      version_num = tonumber(major) * 1000 + tonumber(minor)
+      -- Save to cache
+      local wf = io.open(cache_path, "w")
+      if wf then
+        wf:write(tostring(version_num))
+        wf:close()
+      end
+    end
+  end
+end
+
+-- Set options based on version
+if version_num then
+  -- Multiple tiebreakers and 'end' option require version >= 0.36.0
+  if version_num >= 36 then
+    fzf_opts['--tiebreak'] = 'length,end'
+  else
+    fzf_opts['--tiebreak'] = 'length'
+  end
+
+  -- --scheme=path requires version >= 0.42.0
+  if version_num >= 42 then
+    fzf_opts['--scheme'] = 'path'
+  end
+end
+
 return {
   "ibhagwan/fzf-lua",
   dependencies = { "nvim-tree/nvim-web-devicons" },
@@ -9,24 +54,21 @@ return {
         vertical = "down:50%",
         title = true,
         scrollbar = "float",
+        delay = 100, -- Delay preview by 100ms for faster UI initialization and buttery smooth scrolling
       },
     },
 
-    -- 2. FZF ALGORITHM OPTIONS
-    opts = {
-      -- 'path': Optimized scoring for file paths
-      ['--scheme'] = 'path',
+    -- 2. DYNAMIC FZF ALGORITHM OPTIONS
+    fzf_opts = fzf_opts,
 
-      -- [CRITICAL FOR "EXACT" MATCHING]
-      -- 1. 'length': The shortest result wins. If you type "user", "user.lua" beats "user_profile.lua".
-      -- 2. 'end': Matches at the end of the line (filename) beat matches in the middle (folder name).
-      ['--tiebreak'] = 'length,end',
-      
-      -- [PERFORMANCE] Disable history to speed up opening
-      ['--history'] = '',
+    -- 3. PREVIEWER OPTIONS
+    previewers = {
+      builtin = {
+        syntax_limit_b = 1024 * 100, -- Limit syntax highlighting to files < 100KB to prevent lag
+      },
     },
 
-    -- 3. FILE SEARCH (Ctrl-P)
+    -- 4. FILE SEARCH (Ctrl-P)
     files = {
       -- [UPDATED] Reverted to 'rg' for stability, but optimized for speed.
       -- 1. Removed '--sort path': This is the #1 cause of slowness. We let fzf handle sorting visually.
@@ -43,7 +85,7 @@ return {
       git_icons = true,
     },
 
-    -- 4. CONTENT SEARCH (Live Grep)
+    -- 5. CONTENT SEARCH (Live Grep)
     grep = {
       -- [UPDATED] Live grep with identical exclusions
       rg_opts = "--column --line-number --no-heading --color=always --smart-case --max-columns=4096 " ..

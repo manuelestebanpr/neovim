@@ -14,16 +14,17 @@ cmp.setup({
     ['<C-k>'] = cmp.mapping.select_prev_item({ behavior = 'select' }),
     ['<C-j>'] = cmp.mapping.select_next_item({ behavior = 'select' }),
     ['<Tab>'] = cmp.mapping.confirm({ select = false }), -- Recommended: set select to false for Tab
-    ['<C-a>'] = cmp.mapping.abort(),
+    ['<C-e>'] = cmp.mapping.abort(),
     ['<C-Space>'] = cmp.mapping.complete(),
     ['<C-u>'] = cmp.mapping.scroll_docs(-4),
     ['<C-d>'] = cmp.mapping.scroll_docs(4),
   }),
   sources = cmp.config.sources({
     { name = 'nvim_lsp' },
+    { name = 'path' },
   }, {
-      { name = 'buffer' },
-    }),
+    { name = 'buffer' },
+  }),
   preselect = 'item', 
   completion = {
     completeopt = 'menu,menuone,noinsert'
