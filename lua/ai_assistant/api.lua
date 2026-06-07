@@ -31,6 +31,14 @@ function M.get_provider_details(model_name)
     temperature = 0.2
     name = name:gsub("%-low$", "")
   end
+  -- Local llama.cpp (`llama-server`) models carry an explicit "llamacpp:" routing
+  -- prefix (applied by discovery / the picker). It's required because a bare local
+  -- model name is indistinguishable from a cloud one — a llama-server "gemma-*"
+  -- or "gpt-*" alias would otherwise be misrouted to Gemini/OpenAI. Strip the
+  -- prefix so the real model id is what reaches the request body.
+  if name:match("^llamacpp:") then
+    return "llamacpp", temperature, (name:gsub("^llamacpp:", ""))
+  end
   local lower = name:lower()
   local provider
   if lower:match("^gemini") or lower:match("^gemma") then
@@ -53,6 +61,10 @@ end
 -- the raw provider is still used for the endpoint URL, auth header, and API key.
 local function wire_provider(provider)
   if provider == "moonshot" then return "openai" end
+  -- llama.cpp's server is OpenAI Chat Completions compatible, so it reuses the
+  -- OpenAI message builder / streaming parser / response parser. `provider` still
+  -- selects the (configurable, local) endpoint URL and optional auth.
+  if provider == "llamacpp" then return "openai" end
   return provider
 end
 
@@ -83,7 +95,7 @@ end
 function M.fetch_available_models(callback)
   local settings = config.load_settings()
   local curl = require("plenary.curl")
-  local results = { gemini = {}, anthropic = {}, openai = {}, moonshot = {}, ollama = {} }
+  local results = { gemini = {}, anthropic = {}, openai = {}, moonshot = {}, ollama = {}, llamacpp = {} }
   local pending = 0
   local done = false
 
@@ -91,7 +103,7 @@ function M.fetch_available_models(callback)
     if done then return end
     done = true
     local seen, ordered = {}, {}
-    for _, provider in ipairs({ "gemini", "anthropic", "openai", "moonshot", "ollama" }) do
+    for _, provider in ipairs({ "gemini", "anthropic", "openai", "moonshot", "ollama", "llamacpp" }) do
       local list = results[provider]
       if #list == 0 and DEFAULT_MODELS[provider] then
         list = DEFAULT_MODELS[provider]
@@ -108,6 +120,13 @@ function M.fetch_available_models(callback)
             table.insert(ordered, { id = m .. "-low", text = m .. " (Low Effort)" })
             table.insert(ordered, { id = m .. "-medium", text = m .. " (Medium Effort)" })
             table.insert(ordered, { id = m .. "-high", text = m .. " (High Effort)" })
+          elseif provider == "llamacpp" then
+            -- `m` already carries the "llamacpp:" routing prefix; show a friendly
+            -- label (basename of the served model id) so a long gguf path doesn't
+            -- dominate the picker.
+            local raw = m:gsub("^llamacpp:", "")
+            local label = raw:match("([^/\\]+)$") or raw
+            table.insert(ordered, { id = m, text = label .. "  (llama-server)" })
           else
             table.insert(ordered, { id = m, text = m })
           end
@@ -239,6 +258,25 @@ function M.fetch_available_models(callback)
       if decoded.models then
         for _, m in ipairs(decoded.models) do
           if m.name then table.insert(out.ollama, m.name) end
+        end
+      end
+    end,
+  })
+
+  -- llama.cpp (llama-server) local discovery — OpenAI-compatible /v1/models.
+  -- Always probed (cheap, fails fast when the server isn't up). Each served model
+  -- id is tagged with the "llamacpp:" routing prefix so it can't be confused with
+  -- a same-named cloud model when the picker selection is later routed.
+  local llama_url = config.get_llama_server_url(settings)
+  local llama_key = config.get_api_key(settings, "llamacpp")
+  request({
+    url = llama_url .. "/v1/models",
+    headers = (llama_key ~= "") and { Authorization = "Bearer " .. llama_key } or nil,
+    parse = function(decoded, out)
+      if decoded.data then
+        for _, m in ipairs(decoded.data) do
+          local id = m.id or ""
+          if id ~= "" then table.insert(out.llamacpp, "llamacpp:" .. id) end
         end
       end
     end,
@@ -534,6 +572,14 @@ local function trim_history_to_budget(history, budget, system_prompt, processed_
     end
   end
 
+  -- After pairing, the surviving history must still BEGIN with a real user turn.
+  -- If the leading user turn was trimmed away, a model/tool turn is now first,
+  -- which every provider rejects (Gemini/Anthropic 400 "first turn must be user"
+  -- / orphaned tool_result), making a reloaded long chat unable to continue.
+  while #trimmed > 0 and trimmed[1].role ~= "user" do
+    table.remove(trimmed, 1)
+  end
+
   if trimmed_count > 0 and opts.notify_fn then
     opts.notify_fn(string.format("\n> **System**: Context budget exceeded. Trimmed %d older turns to fit budget.\n", trimmed_count))
   end
@@ -782,7 +828,15 @@ local function build_anthropic_messages(history, processed_prompt, append_user)
   if append_user then
     messages[#messages + 1] = { role = "user", content = processed_prompt }
   end
-  while #messages > 0 and messages[1].role ~= "user" do table.remove(messages, 1) end
+  -- The conversation must lead with a real user turn. A tool_result turn is built
+  -- with role="user" (above) but is an orphan without its preceding tool_use, so
+  -- strip a leading tool_result block too (Anthropic 400s otherwise).
+  local function leading_tool_result(m)
+    return type(m.content) == "table" and m.content[1] and m.content[1].type == "tool_result"
+  end
+  while #messages > 0 and (messages[1].role ~= "user" or leading_tool_result(messages[1])) do
+    table.remove(messages, 1)
+  end
   return messages
 end
 
@@ -974,6 +1028,18 @@ local function parse_response_tools(provider, data)
   return text, tools, thinking, gemini_sig, reasoning
 end
 
+-- A turn is "truncated" when the model stopped because it hit the output-token
+-- cap rather than finishing. Each provider names the reason differently. A
+-- truncated turn is dangerous for write_file (content is cut off mid-file), so
+-- the loop refuses such writes and warns the user instead of corrupting a file.
+local function is_truncated_stop(wire, reason)
+  if not reason then return false end
+  if wire == "anthropic" then return reason == "max_tokens" end
+  if wire == "gemini" then return reason == "MAX_TOKENS" end
+  -- openai / moonshot / ollama all report a length-based cutoff as "length".
+  return reason == "length"
+end
+
 -- ---- Streaming accumulation: update state per chunk, return text delta ------
 -- state = { tool_blocks = { [index] = {id,name,json} }, tool_list = {},
 --          think_blocks = { [index] = {type,thinking,signature} }, think_list = {} }
@@ -1006,10 +1072,16 @@ local function stream_update(provider, obj, state, emit, emit_thinking)
       elseif state.think_blocks[obj.index] then
         state.think_list[#state.think_list + 1] = state.think_blocks[obj.index]
       end
+    elseif obj.type == "message_delta" and obj.delta then
+      -- The final message_delta carries stop_reason ("end_turn" | "tool_use" |
+      -- "max_tokens"); capture it so finalize can flag a truncated turn.
+      state.stop_reason = obj.delta.stop_reason or state.stop_reason
     end
   elseif provider == "openai" then
     local ch = obj.choices and obj.choices[1]
     local delta = ch and ch.delta
+    -- finish_reason == "length" means the answer was cut off at the token cap.
+    if ch and ch.finish_reason then state.stop_reason = ch.finish_reason end
     if delta then
       -- Moonshot/Kimi reasoning models stream chain-of-thought on a separate
       -- delta.reasoning_content channel (before the answer's delta.content).
@@ -1034,6 +1106,8 @@ local function stream_update(provider, obj, state, emit, emit_thinking)
     end
   elseif provider == "gemini" then
     local cand = obj.candidates and obj.candidates[1]
+    -- finishReason == "MAX_TOKENS" means the output was truncated at the cap.
+    if cand and cand.finishReason then state.stop_reason = cand.finishReason end
     local parts = cand and cand.content and cand.content.parts or {}
     for _, p in ipairs(parts) do
       if p.text then emit(p.text) end
@@ -1052,6 +1126,8 @@ local function stream_update(provider, obj, state, emit, emit_thinking)
       end
     end
   elseif provider == "ollama" then
+    -- done_reason == "length" means generation stopped at num_predict (truncated).
+    if obj.done_reason then state.stop_reason = obj.done_reason end
     local msg = obj.message
     if msg then
       if msg.content and msg.content ~= "" then emit(msg.content) end
@@ -1130,6 +1206,8 @@ function M.send_prompt_internal(opts, callback)
     url = "https://api.openai.com/v1/chat/completions"
   elseif provider == "moonshot" then
     url = "https://api.moonshot.ai/v1/chat/completions"
+  elseif provider == "llamacpp" then
+    url = config.get_llama_server_url(settings) .. "/v1/chat/completions"
   else
     url = "http://localhost:11434/api/chat"
   end
@@ -1278,7 +1356,13 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
     headers["anthropic-version"] = "2023-06-01"
     payload = {
       model = clean_model,
-      max_tokens = 8192,
+      -- 8192 was far below the model ceiling (Opus 4.x ~128K, Sonnet 4.6 ~64K out)
+      -- and the single biggest cause of write_file truncation: a whole-file write
+      -- of dense source easily exceeds ~8k output tokens and gets cut off
+      -- mid-content (and on the effort path below, adaptive-thinking tokens draw
+      -- from this same budget). The streaming path sets stream=true, so a larger
+      -- cap does not risk an HTTP timeout.
+      max_tokens = 32768,
       -- System as a content block with a prompt-cache breakpoint (stable prefix).
       system = { { type = "text", text = system_prompt, cache_control = { type = "ephemeral" } } },
       messages = build_anthropic_messages(pruned_history, processed_prompt, append_user),
@@ -1294,6 +1378,21 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
     if not anthropic_rejects_sampling(clean_model) then
       payload.temperature = final_temp
     end
+  elseif provider == "llamacpp" then
+    -- llama.cpp's server speaks the OpenAI Chat Completions API (wire == "openai",
+    -- so build_openai_messages / stream_update / parse_response_tools all apply).
+    -- Auth is only sent when the server was launched with --api-key. Native tool
+    -- calling requires the server to be run with a tool-capable chat template
+    -- (e.g. `llama-server --jinja`); the request is otherwise unchanged.
+    if api_key ~= "" then headers["Authorization"] = "Bearer " .. api_key end
+    payload = {
+      -- llama.cpp serves a single loaded model and largely ignores this field, but
+      -- the OpenAI schema requires it to be present and non-empty.
+      model = (clean_model ~= "" and clean_model) or "local-model",
+      messages = build_openai_messages(pruned_history, system_prompt, processed_prompt, append_user),
+      tools = openai_tools(),
+      temperature = final_temp,
+    }
   elseif provider == "ollama" then
     payload = {
       model = clean_model,
@@ -1388,8 +1487,9 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
             -- Moonshot/Kimi chain-of-thought accumulated across the stream; replayed
             -- on the tool-call turn (build_openai_messages). nil for other providers.
             local reasoning_content = sstate.reasoning
+            local truncated = is_truncated_stop(wire, sstate.stop_reason)
             if full ~= "" or (tool_calls and #tool_calls > 0) then
-              respond(true, full, tool_calls, thinking_blocks, gemini_sig, reasoning_content)
+              respond(true, full, tool_calls, thinking_blocks, gemini_sig, reasoning_content, truncated)
               return
             end
             if response and response.status and response.status >= 200 and response.status < 300 then
@@ -1485,7 +1585,11 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
           end
 
           local response_text, tool_calls, thinking_blocks, gemini_sig, reasoning_content = parse_response_tools(wire, data)
-          respond(true, response_text, tool_calls, thinking_blocks, gemini_sig, reasoning_content)
+          local stop = data.stop_reason
+            or (data.choices and data.choices[1] and data.choices[1].finish_reason)
+            or (data.candidates and data.candidates[1] and data.candidates[1].finishReason)
+            or data.done_reason
+          respond(true, response_text, tool_calls, thinking_blocks, gemini_sig, reasoning_content, is_truncated_stop(wire, stop))
         end)
         if not ok_fin then
           respond(false, "Response parse error: " .. tostring(err))
@@ -1545,10 +1649,18 @@ function M.send_prompt(opts, callback)
     opts._history_cloned = true
   end
 
-  M.send_prompt_internal(opts, function(success, response_text, tool_calls, thinking_blocks, gemini_sig, reasoning_content)
+  M.send_prompt_internal(opts, function(success, response_text, tool_calls, thinking_blocks, gemini_sig, reasoning_content, truncated)
     if not success then
       callback(false, response_text, opts.history)
       return
+    end
+
+    -- The model stopped because it hit the output-token cap, not because it
+    -- finished its turn. Any write_file from this turn is cut off mid-content, so
+    -- warn the user; the write_file handler below refuses such writes outright so
+    -- a half-written file never lands on disk (the cause of the reload crash).
+    if truncated and opts.notify_fn then
+      opts.notify_fn("\n> **System**: \226\154\160 The response hit the output-token limit (max_tokens) and was truncated. File writes from this turn are skipped to avoid writing an incomplete file. Ask the assistant to continue, or split the change into smaller writes.\n")
     end
 
     -- Native tool calls: execute each (denylist + project-root + approval/diff),
@@ -1579,10 +1691,26 @@ function M.send_prompt(opts, callback)
           -- Tools done; the model now digests their output. Surface that gap so the
           -- header isn't frozen between tool execution and the next streamed token.
           emit_status(opts, "tools")
+          -- Bound the native tool round-trip the way handle_orchestration bounds
+          -- delegation depth. Without this, a model that keeps emitting tool calls
+          -- (e.g. retrying a write it can't complete) recurses send_prompt forever,
+          -- so the turn never resolves and the spinner never clears ("can't finish").
+          -- The model + tool turns above are already recorded, so the executed
+          -- tools' results are preserved when we halt.
+          local tool_iters = (opts._tool_iters or 0) + 1
+          local MAX_TOOL_ITERS = 25
+          if tool_iters > MAX_TOOL_ITERS then
+            if opts.notify_fn then
+              opts.notify_fn(string.format("\n> **System**: Tool-call loop limit (%d) reached; stopping so the turn can finish.\n", MAX_TOOL_ITERS))
+            end
+            callback(true, response_text ~= "" and response_text or "[Stopped: tool-call loop limit reached.]", opts.history)
+            return
+          end
           local next_opts = vim.deepcopy(opts)
           next_opts.prompt = ""
           next_opts.is_tool_continuation = true
           next_opts.fresh_user_turn = false
+          next_opts._tool_iters = tool_iters
           M.send_prompt(next_opts, callback)
         end)
         -- If kicking off the continuation itself fails, end the turn gracefully so
@@ -1632,6 +1760,13 @@ function M.send_prompt(opts, callback)
         elseif tool_type == "read_file" then
           details = "Read File: `" .. tostring(tool_arg) .. "`"
         elseif tool_type == "write_file" then
+          -- A write whose content was cut off at the token cap would corrupt the
+          -- file on disk (and crash Neovim when it reloads broken Lua). Refuse it
+          -- and hand the model a correctable error instead of writing garbage.
+          if truncated then
+            table.insert(results, { id = tc.id, name = tc.name, output = "Error: the response was truncated at the output-token limit, so this file's content is incomplete. The file was NOT written. Split the file into smaller writes and retry." })
+            return process(i + 1)
+          end
           -- Hand the model a correctable error instead of overwriting the file
           -- with empty content and falsely reporting success.
           if type(tool_arg.content) ~= "string" then

@@ -109,13 +109,15 @@ local function update_header(header, session_data, status_text)
   -- live outside msg.content and are often the bulk of an agentic conversation)
   local history_chars = 0
   for _, msg in ipairs(session_data.history_data or {}) do
-    history_chars = history_chars + #(msg.content or "")
-    if msg.tool_results then
+    -- A reloaded chat can carry an explicit JSON null (-> vim.NIL, which is
+    -- truthy yet raises under # and ipairs); type-check before measuring.
+    if type(msg.content) == "string" then history_chars = history_chars + #msg.content end
+    if type(msg.tool_results) == "table" then
       for _, r in ipairs(msg.tool_results) do
-        history_chars = history_chars + #(r.output or "")
+        if type(r.output) == "string" then history_chars = history_chars + #r.output end
       end
     end
-    if msg.tool_calls then
+    if type(msg.tool_calls) == "table" then
       for _, c in ipairs(msg.tool_calls) do
         local ok, enc = pcall(vim.fn.json_encode, c.input or {})
         history_chars = history_chars + #(ok and enc or "")
@@ -407,6 +409,10 @@ function M.select_model(callback, allow_back)
         table.insert(presets, { text = flagship .. " (High Effort)", id = flagship .. "-high" })
       end
       table.insert(presets, { text = "ollama (Local)", id = "ollama" })
+      -- llama-server fallback (shown when discovery returns nothing, e.g. the
+      -- server is down). The "llamacpp:" prefix routes it to the local llama.cpp
+      -- endpoint; the model name after it is ignored by a single-model server.
+      table.insert(presets, { text = "llama-server (Local)", id = "llamacpp:local-model" })
       for _, m in ipairs(presets) do
         table.insert(lines, Menu.item(m.text, { id = m.id }))
       end
@@ -527,9 +533,23 @@ local function configure_api_keys()
   local Menu = require("nui.menu")
   local event = require("nui.utils.autocmd").event
 
+  -- Hoisted so the window height can size to the item count (matches the dynamic
+  -- sizing used by the other menus) instead of a hardcoded value that silently
+  -- clips when another provider is added.
+  local lines = {
+    Menu.item("< Back to Settings", { id = "back" }),
+    Menu.separator("Providers"),
+    Menu.item("Gemini", { id = "gemini" }),
+    Menu.item("Anthropic (Claude)", { id = "anthropic" }),
+    Menu.item("OpenAI", { id = "openai" }),
+    Menu.item("Moonshot (Kimi)", { id = "moonshot" }),
+    Menu.item("Ollama (Local)", { id = "ollama" }),
+    Menu.item("llama.cpp (llama-server)", { id = "llamacpp" }),
+  }
+
   local menu = Menu({
     position = "50%",
-    size = { width = 45, height = 8 },
+    size = { width = 45, height = math.min(12, #lines + 2) },
     border = {
       style = "rounded",
       text = { top = " Select Provider ", top_align = "center" }
@@ -537,17 +557,24 @@ local function configure_api_keys()
     buf_options = { modifiable = true, readonly = false },
     win_options = { winhighlight = "Normal:Normal,FloatBorder:FloatBorder" }
   }, {
-    lines = {
-      Menu.item("< Back to Settings", { id = "back" }),
-      Menu.separator("Providers"),
-      Menu.item("Gemini", { id = "gemini" }),
-      Menu.item("Anthropic (Claude)", { id = "anthropic" }),
-      Menu.item("OpenAI", { id = "openai" }),
-      Menu.item("Moonshot (Kimi)", { id = "moonshot" }),
-      Menu.item("Ollama (Local)", { id = "ollama" })
-    },
+    lines = lines,
     on_submit = function(item)
       if item.id == "back" then
+        M.manage_context()
+        return
+      end
+      -- llama-server is local: configure its URL (port) plus an optional bearer
+      -- token (only needed if it was started with --api-key) rather than a key alone.
+      if item.id == "llamacpp" then
+        local settings = config.load_settings()
+        local url = vim.fn.input("llama-server URL: ", config.get_llama_server_url(settings))
+        if url ~= "" then settings.llama_server_url = url end
+        -- Only overwrite when something is entered, so cancelling (Esc -> "") at
+        -- the prompt doesn't wipe a previously stored key — same as the providers below.
+        local key = vim.fn.inputsecret("llama-server API key (blank = keep current): ")
+        if key ~= "" then settings.api_keys.llamacpp = key end
+        config.save_settings(settings)
+        vim.notify("AI Assistant: llama-server set to " .. config.get_llama_server_url(settings), vim.log.levels.INFO)
         M.manage_context()
         return
       end
@@ -1363,18 +1390,20 @@ function M.toggle_chat(selected_text, loaded_history, session_id)
   -- blank "AI Assistant" blocks.
   if loaded_history and #loaded_history > 0 then
     for _, msg in ipairs(loaded_history) do
-      if msg.tool_results then
+      -- type-guard every field: a reloaded chat may contain an explicit JSON null
+      -- (vim.NIL), which is truthy but raises under ipairs/# and the .. operator.
+      if type(msg.tool_results) == "table" then
         local names = {}
         for _, r in ipairs(msg.tool_results) do names[#names + 1] = r.name or "tool" end
         append_to_history(history, string.format("\n> ✔ tool result: %s\n", table.concat(names, ", ")))
-      elseif msg.tool_calls then
-        if msg.content and msg.content ~= "" then
+      elseif type(msg.tool_calls) == "table" then
+        if type(msg.content) == "string" and msg.content ~= "" then
           append_to_history(history, string.format("\n### AI Assistant\n%s\n", msg.content))
         end
         local calls = {}
         for _, c in ipairs(msg.tool_calls) do calls[#calls + 1] = c.name or "tool" end
         append_to_history(history, string.format("> ⚙ ran tool(s): %s\n", table.concat(calls, ", ")))
-      elseif msg.content and msg.content ~= "" then
+      elseif type(msg.content) == "string" and msg.content ~= "" then
         local speaker = msg.role == "user" and "User" or "AI Assistant"
         append_to_history(history, string.format("\n## %s\n%s\n", speaker, msg.content))
       end

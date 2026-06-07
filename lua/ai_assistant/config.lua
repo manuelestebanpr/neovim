@@ -63,6 +63,11 @@ local default_settings = {
   -- Fast/cheap model used for delegated sub-agents that don't pin their own
   -- model (keeps the expensive coordinator model off exploratory sub-tasks).
   default_subagent_model = "gemini-2.5-flash",
+  -- Base URL of a local llama.cpp server (`llama-server`), which exposes an
+  -- OpenAI-compatible API. Models served here are discovered from
+  -- `<url>/v1/models` and tagged with a "llamacpp:" prefix in the picker. Change
+  -- the port here if you launched llama-server on a different one.
+  llama_server_url = "http://127.0.0.1:8080",
   -- When true (and a vector index exists), inject the most relevant retrieved
   -- code chunks for each query instead of relying only on whole-file context.
   rag_enabled = false,
@@ -104,6 +109,9 @@ local default_settings = {
     anthropic = "",
     ollama = "",
     moonshot = "",
+    -- Only needed if llama-server was started with `--api-key`; left blank,
+    -- requests go out unauthenticated (the common local setup).
+    llamacpp = "",
   },
   user_context = {
     { id = "developer_profile", text = "I am a full stack software engineer." },
@@ -148,6 +156,7 @@ local ENV_KEYS = {
   anthropic = "ANTHROPIC_API_KEY",
   ollama = "OLLAMA_API_KEY",
   moonshot = "MOONSHOT_API_KEY",
+  llamacpp = "LLAMACPP_API_KEY",
 }
 
 ----------------------------------------------------------------------
@@ -263,6 +272,17 @@ end
 
 function M.get_env_key_name(provider)
   return ENV_KEYS[provider]
+end
+
+-- Normalized base URL of the local llama.cpp server. Trailing slashes are
+-- trimmed so callers can safely append "/v1/...". Falls back to the documented
+-- default port when unset.
+function M.get_llama_server_url(settings)
+  local url = settings and settings.llama_server_url
+  if not url or url == "" then
+    url = "http://127.0.0.1:8080"
+  end
+  return (url:gsub("/+$", ""))
 end
 
 function M.get_default_settings()
