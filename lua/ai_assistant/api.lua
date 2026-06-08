@@ -16,6 +16,22 @@ local function fold_card(summary, body)
   return "\n" .. summary .. " " .. M.FOLD_OPEN .. "\n" .. body .. "\n" .. M.FOLD_CLOSE .. "\n"
 end
 
+-- JSON null decodes (via vim.fn.json_decode / vim.json.decode) to `vim.NIL`, a
+-- USERDATA sentinel that is TRUTHY and compares `~= ""` as true. So a value read
+-- straight from a decoded provider response/stream may be vim.NIL even though the
+-- code "looks" guarded by `if x then` or `x ~= ""`. If it then reaches `..` /
+-- table.concat / a vim.fn string argument it raises "attempt to concatenate a
+-- userdata value" or "invalid value (userdata) ... for 'concat'". This is exactly
+-- what broke llama.cpp/Qwen, whose OpenAI-compatible stream sends `content: null`
+-- on the role-priming, tool_call, and final chunks. These two coercions are the
+-- single choke point every decode site funnels through.
+local function jstr(v)            -- -> a real string ("" for nil / vim.NIL / non-string)
+  return type(v) == "string" and v or ""
+end
+local function jstr_or_nil(v)     -- -> a real string, or nil (so `x and ...` works)
+  return type(v) == "string" and v or nil
+end
+
 ----------------------------------------------------------------------
 -- Provider Routing & Defaults
 ----------------------------------------------------------------------
@@ -458,6 +474,24 @@ function M.execute_tool(tool_type, tool_arg, on_complete, opts)
     return
   end
 
+  -- Web tools are async network reads handled by ai_assistant.search, which
+  -- guarantees its callback fires exactly once (on the main loop) with a string
+  -- and never raises. We still pcall the kickoff so a require/spawn failure
+  -- becomes a model-visible error rather than a stalled loop.
+  if tool_type == "web_search" then
+    local ok, err = pcall(function()
+      require("ai_assistant.search").search(tool_arg.query, { max_results = tool_arg.max_results }, complete)
+    end)
+    if not ok then complete("Error: web_search failed: " .. tostring(err)) end
+    return
+  elseif tool_type == "fetch_url" then
+    local ok, err = pcall(function()
+      require("ai_assistant.search").fetch(tool_arg.url, complete)
+    end)
+    if not ok then complete("Error: fetch_url failed: " .. tostring(err)) end
+    return
+  end
+
   -- Synchronous tools (read/write/memory). Wrap so a raised IO/filesystem error
   -- becomes a graceful "Error: ..." tool result the model is told about.
   local ok, err = pcall(function()
@@ -508,7 +542,7 @@ end
 ----------------------------------------------------------------------
 
 local function estimate_tokens(text)
-  return math.ceil(#(text or "") / 4)
+  return math.ceil(#jstr(text) / 4)
 end
 
 local function get_history_tokens(history_data)
@@ -656,20 +690,22 @@ local function openai_is_reasoning(model)
 end
 
 -- Pulls the incremental text out of one parsed streaming chunk, per provider.
+-- Every return is jstr_or_nil-coerced so a JSON-null delta (vim.NIL) can never
+-- escape as userdata.
 local function extract_stream_delta(provider, obj)
   if provider == "anthropic" then
     if obj.type == "content_block_delta" and obj.delta and obj.delta.type == "text_delta" then
-      return obj.delta.text
+      return jstr_or_nil(obj.delta.text)
     end
   elseif provider == "openai" then
     local ch = obj.choices and obj.choices[1]
-    return ch and ch.delta and ch.delta.content or nil
+    return jstr_or_nil(ch and ch.delta and ch.delta.content)
   elseif provider == "gemini" then
     local cand = obj.candidates and obj.candidates[1]
     local part = cand and cand.content and cand.content.parts and cand.content.parts[1]
-    return part and part.text or nil
+    return jstr_or_nil(part and part.text)
   elseif provider == "ollama" then
-    return obj.message and obj.message.content or nil
+    return jstr_or_nil(obj.message and obj.message.content)
   end
   return nil
 end
@@ -707,28 +743,65 @@ local TOOL_DEFS = {
     properties = { fact = { type = "string", description = "The single fact to remember" } },
     required = { "fact" },
   },
+  -- Web tools (web_search / fetch_url) are appended only when web search is
+  -- enabled in settings; see active_tool_defs below. Executed client-side via
+  -- ai_assistant.search, so they work for EVERY provider, the local llama.cpp
+  -- model included.
+  {
+    name = "web_search",
+    description = "Search the public web and get the top results as a numbered list of {title, URL, snippet}. Use this for anything outside the codebase: current events, library/API docs, latest versions, error messages, unfamiliar tools. After searching, call fetch_url on the most relevant result to read its full content, then cite the source URLs.",
+    properties = {
+      query = { type = "string", description = "The search query." },
+      max_results = { type = "integer", description = "How many results to return (1-10, default 5)." },
+    },
+    required = { "query" },
+  },
+  {
+    name = "fetch_url",
+    description = "Fetch a single web page (or PDF) and return its main text content as clean, truncated markdown. Only pass a URL that appeared earlier (a web_search result, or one the user gave). Use this to read a page before relying on or citing it.",
+    properties = {
+      url = { type = "string", description = "The absolute http(s) URL to fetch." },
+    },
+    required = { "url" },
+  },
 }
 
-local function anthropic_tools()
+-- Names of the web tools that active_tool_defs strips when web search is off.
+local WEB_TOOL_NAMES = { web_search = true, fetch_url = true }
+
+-- The canonical tool list for THIS request: TOOL_DEFS, minus the web tools when
+-- web search is disabled, so the model is never offered a tool it can't run.
+local function active_tool_defs(settings)
+  local ws = settings and settings.web_search
+  local web_on = (ws == nil) or (ws.enabled ~= false and ws.provider ~= "disabled")
+  if web_on then return TOOL_DEFS end
   local out = {}
   for _, d in ipairs(TOOL_DEFS) do
+    if not WEB_TOOL_NAMES[d.name] then out[#out + 1] = d end
+  end
+  return out
+end
+
+local function anthropic_tools(defs)
+  local out = {}
+  for _, d in ipairs(defs or TOOL_DEFS) do
     out[#out + 1] = { name = d.name, description = d.description, input_schema = { type = "object", properties = d.properties, required = d.required } }
   end
   return out
 end
 
 -- OpenAI + Ollama share the function-tool shape.
-local function openai_tools()
+local function openai_tools(defs)
   local out = {}
-  for _, d in ipairs(TOOL_DEFS) do
+  for _, d in ipairs(defs or TOOL_DEFS) do
     out[#out + 1] = { type = "function", ["function"] = { name = d.name, description = d.description, parameters = { type = "object", properties = d.properties, required = d.required } } }
   end
   return out
 end
 
-local function gemini_tools()
+local function gemini_tools(defs)
   local fd = {}
-  for _, d in ipairs(TOOL_DEFS) do
+  for _, d in ipairs(defs or TOOL_DEFS) do
     fd[#fd + 1] = { name = d.name, description = d.description, parameters = { type = "object", properties = d.properties, required = d.required } }
   end
   return { { functionDeclarations = fd } }
@@ -752,6 +825,11 @@ function M.tool_call_to_exec(name, input)
     return "write_file", { path = s(input.path), content = input.content }
   elseif name == "save_memory" then
     return "save_memory", s(input.fact)
+  elseif name == "web_search" then
+    -- max_results stays raw (number|string|nil); search.lua clamps/coerces it.
+    return "web_search", { query = s(input.query), max_results = input.max_results }
+  elseif name == "fetch_url" then
+    return "fetch_url", { url = s(input.url) }
   end
   return nil, nil
 end
@@ -787,7 +865,7 @@ local function build_anthropic_messages(history, processed_prompt, append_user)
     if msg.tool_results then
       local content = {}
       for _, r in ipairs(msg.tool_results) do
-        content[#content + 1] = { type = "tool_result", tool_use_id = r.id, content = r.output or "" }
+        content[#content + 1] = { type = "tool_result", tool_use_id = jstr_or_nil(r.id), content = jstr(r.output) }
       end
       messages[#messages + 1] = { role = "user", content = content }
     elseif msg.tool_calls then
@@ -800,29 +878,33 @@ local function build_anthropic_messages(history, processed_prompt, append_user)
       -- an assistant turn whose leading thinking is incomplete, which the API
       -- rejects. Only replay the blocks if EVERY one is emittable; otherwise emit
       -- none (a tool_use turn with no leading thinking block is itself valid).
+      -- jstr/jstr_or_nil here so a loaded chat carrying a null signature/data/text
+      -- (vim.NIL) can't be replayed verbatim — Anthropic 400s on a null in any of
+      -- these, and the all-or-nothing gate must judge a real string, not userdata.
       local tbs = msg.thinking_blocks or {}
       local all_emittable = true
       for _, tb in ipairs(tbs) do
-        local ok = (tb.type == "redacted_thinking" and tb.data)
-          or (tb.signature and tb.signature ~= "")
+        local ok = (tb.type == "redacted_thinking" and jstr(tb.data) ~= "")
+          or (jstr(tb.signature) ~= "")
         if not ok then all_emittable = false break end
       end
       if all_emittable then
         for _, tb in ipairs(tbs) do
           if tb.type == "redacted_thinking" then
-            content[#content + 1] = { type = "redacted_thinking", data = tb.data }
+            content[#content + 1] = { type = "redacted_thinking", data = jstr(tb.data) }
           else
-            content[#content + 1] = { type = "thinking", thinking = tb.thinking or "", signature = tb.signature }
+            content[#content + 1] = { type = "thinking", thinking = jstr(tb.thinking), signature = jstr_or_nil(tb.signature) }
           end
         end
       end
-      if msg.content and msg.content ~= "" then content[#content + 1] = { type = "text", text = msg.content } end
+      local mc = jstr(msg.content)
+      if mc ~= "" then content[#content + 1] = { type = "text", text = mc } end
       for _, c in ipairs(msg.tool_calls) do
-        content[#content + 1] = { type = "tool_use", id = c.id, name = c.name, input = nonempty_obj(c.input) }
+        content[#content + 1] = { type = "tool_use", id = jstr_or_nil(c.id), name = jstr(c.name), input = nonempty_obj(c.input) }
       end
       messages[#messages + 1] = { role = "assistant", content = content }
     else
-      messages[#messages + 1] = { role = (msg.role == "model" or msg.role == "assistant") and "assistant" or "user", content = msg.content or "" }
+      messages[#messages + 1] = { role = (msg.role == "model" or msg.role == "assistant") and "assistant" or "user", content = jstr(msg.content) }
     end
   end
   if append_user then
@@ -845,14 +927,14 @@ local function build_openai_messages(history, system_prompt, processed_prompt, a
   for _, msg in ipairs(history) do
     if msg.tool_results then
       for _, r in ipairs(msg.tool_results) do
-        messages[#messages + 1] = { role = "tool", tool_call_id = r.id, content = r.output or "" }
+        messages[#messages + 1] = { role = "tool", tool_call_id = jstr_or_nil(r.id), content = jstr(r.output) }
       end
     elseif msg.tool_calls then
       local tcs = {}
       for _, c in ipairs(msg.tool_calls) do
-        tcs[#tcs + 1] = { id = c.id, type = "function", ["function"] = { name = c.name, arguments = vim.fn.json_encode(nonempty_obj(c.input)) } }
+        tcs[#tcs + 1] = { id = jstr_or_nil(c.id), type = "function", ["function"] = { name = jstr(c.name), arguments = vim.fn.json_encode(nonempty_obj(c.input)) } }
       end
-      local entry = { role = "assistant", content = msg.content or "", tool_calls = tcs }
+      local entry = { role = "assistant", content = jstr(msg.content), tool_calls = tcs }
       -- Moonshot/Kimi reasoning models REQUIRE the chain-of-thought that produced
       -- a tool call to be echoed back on that assistant turn, or the tool-result
       -- continuation 400s ("reasoning_content is missing in assistant tool call
@@ -860,13 +942,14 @@ local function build_openai_messages(history, system_prompt, processed_prompt, a
       -- tool_call turn (empty string when none was captured) — omitting it on null
       -- is what triggers the 400. Plain OpenAI never sets it, so it stays absent.
       if reasoning_mode then
-        entry.reasoning_content = msg.reasoning_content or ""
-      elseif msg.reasoning_content and msg.reasoning_content ~= "" then
-        entry.reasoning_content = msg.reasoning_content
+        entry.reasoning_content = jstr(msg.reasoning_content)
+      else
+        local rc = jstr(msg.reasoning_content)
+        if rc ~= "" then entry.reasoning_content = rc end
       end
       messages[#messages + 1] = entry
     else
-      messages[#messages + 1] = { role = (msg.role == "model" or msg.role == "assistant") and "assistant" or "user", content = msg.content or "" }
+      messages[#messages + 1] = { role = (msg.role == "model" or msg.role == "assistant") and "assistant" or "user", content = jstr(msg.content) }
     end
   end
   if append_user then
@@ -880,16 +963,16 @@ local function build_ollama_messages(history, system_prompt, processed_prompt, a
   for _, msg in ipairs(history) do
     if msg.tool_results then
       for _, r in ipairs(msg.tool_results) do
-        messages[#messages + 1] = { role = "tool", content = r.output or "" }
+        messages[#messages + 1] = { role = "tool", content = jstr(r.output) }
       end
     elseif msg.tool_calls then
       local tcs = {}
       for _, c in ipairs(msg.tool_calls) do
-        tcs[#tcs + 1] = { type = "function", ["function"] = { name = c.name, arguments = nonempty_obj(c.input) } }
+        tcs[#tcs + 1] = { type = "function", ["function"] = { name = jstr(c.name), arguments = nonempty_obj(c.input) } }
       end
-      messages[#messages + 1] = { role = "assistant", content = msg.content or "", tool_calls = tcs }
+      messages[#messages + 1] = { role = "assistant", content = jstr(msg.content), tool_calls = tcs }
     else
-      messages[#messages + 1] = { role = (msg.role == "model" or msg.role == "assistant") and "assistant" or "user", content = msg.content or "" }
+      messages[#messages + 1] = { role = (msg.role == "model" or msg.role == "assistant") and "assistant" or "user", content = jstr(msg.content) }
     end
   end
   if append_user then
@@ -904,32 +987,36 @@ local function build_gemini_contents(history, processed_prompt, append_user)
     if msg.tool_results then
       local parts = {}
       for _, r in ipairs(msg.tool_results) do
-        parts[#parts + 1] = { functionResponse = { name = r.name, response = { result = r.output or "" } } }
+        parts[#parts + 1] = { functionResponse = { name = jstr(r.name), response = { result = jstr(r.output) } } }
       end
       turns[#turns + 1] = { role = "user", parts = parts }
     elseif msg.tool_calls then
       local parts = {}
-      if msg.content and msg.content ~= "" then parts[#parts + 1] = { text = msg.content } end
+      local mc = jstr(msg.content)
+      if mc ~= "" then parts[#parts + 1] = { text = mc } end
       for _, c in ipairs(msg.tool_calls) do
-        local part = { functionCall = { name = c.name, args = nonempty_obj(c.input) } }
+        local part = { functionCall = { name = jstr(c.name), args = nonempty_obj(c.input) } }
         -- Replay the captured thoughtSignature on the exact part it arrived on.
         -- Gemini 3 requires it on the functionCall part to continue a tool turn;
         -- for non-first parallel calls and non-thinking models it stays nil (and
-        -- must remain absent — fabricating one would be rejected).
-        if c.thought_signature and c.thought_signature ~= "" then
-          part.thoughtSignature = c.thought_signature
+        -- must remain absent — fabricating one would be rejected). A null sig
+        -- (vim.NIL) from a loaded chat would be replayed as JSON null and 400.
+        local sig = jstr(c.thought_signature)
+        if sig ~= "" then
+          part.thoughtSignature = sig
         end
         parts[#parts + 1] = part
       end
       turns[#turns + 1] = { role = "model", parts = parts }
     else
       local role = (msg.role == "model" or msg.role == "assistant") and "model" or "user"
-      local part = { text = msg.content or "" }
+      local part = { text = jstr(msg.content) }
       -- Echo back a signature captured from a pure-thinking (non-functionCall)
       -- model turn on its text part — recommended to keep Gemini's reasoning
       -- continuity. Only ever set on model turns; user turns never carry one.
-      if role == "model" and msg.thought_signature and msg.thought_signature ~= "" then
-        part.thoughtSignature = msg.thought_signature
+      local sig = jstr(msg.thought_signature)
+      if role == "model" and sig ~= "" then
+        part.thoughtSignature = sig
       end
       turns[#turns + 1] = { role = role, parts = { part } }
     end
@@ -959,30 +1046,39 @@ local function parse_response_tools(provider, data)
   if provider == "anthropic" then
     if type(data.content) == "table" then
       for _, block in ipairs(data.content) do
-        if block.type == "text" and block.text then
+        if block.type == "text" and type(block.text) == "string" then
           text = text .. block.text
         elseif block.type == "thinking" then
-          thinking[#thinking + 1] = { type = "thinking", thinking = block.thinking or "", signature = block.signature }
+          -- Coerce thinking/signature: a null signature replayed verbatim on a
+          -- tool_use turn would 400 the continuation; jstr_or_nil keeps it absent.
+          thinking[#thinking + 1] = { type = "thinking", thinking = jstr(block.thinking), signature = jstr_or_nil(block.signature) }
         elseif block.type == "redacted_thinking" then
           thinking[#thinking + 1] = { type = "redacted_thinking", data = block.data }
         elseif block.type == "tool_use" then
-          tools[#tools + 1] = { id = block.id, name = block.name, input = block.input or {} }
+          tools[#tools + 1] = { id = jstr_or_nil(block.id), name = jstr(block.name), input = (type(block.input) == "table") and block.input or {} }
         end
       end
     end
   elseif provider == "openai" then
     local msg = data.choices and data.choices[1] and data.choices[1].message
     if msg then
-      text = msg.content or ""
+      text = jstr(msg.content)
       -- Moonshot/Kimi reasoning models return the chain-of-thought here; captured
       -- so it can be replayed on the tool-call turn (build_openai_messages).
-      if msg.reasoning_content and msg.reasoning_content ~= "" then
-        reasoning = msg.reasoning_content
-      end
-      for _, tc in ipairs(msg.tool_calls or {}) do
+      local rc = jstr(msg.reasoning_content)
+      if rc ~= "" then reasoning = rc end
+      for i, tc in ipairs(msg.tool_calls or {}) do
         local fn = tc["function"] or {}
-        local ok, args = pcall(vim.fn.json_decode, fn.arguments or "{}")
-        tools[#tools + 1] = { id = tc.id, name = fn.name, input = (ok and type(args) == "table") and args or {} }
+        local argstr = jstr(fn.arguments)
+        if argstr == "" then argstr = "{}" end
+        local ok, args = pcall(vim.fn.json_decode, argstr)
+        -- Fall back to a synthetic id when the server (e.g. some llama.cpp builds)
+        -- omits one, so the continuation's tool message still has a tool_call_id.
+        tools[#tools + 1] = {
+          id = jstr_or_nil(tc.id) or ("call_" .. i .. "_" .. jstr(fn.name)),
+          name = jstr(fn.name),
+          input = (ok and type(args) == "table") and args or {},
+        }
       end
     end
   elseif provider == "gemini" then
@@ -990,7 +1086,7 @@ local function parse_response_tools(provider, data)
     local parts = cand and cand.content and cand.content.parts or {}
     local i = 0
     for _, p in ipairs(parts) do
-      if p.text then text = text .. p.text end
+      if type(p.text) == "string" then text = text .. p.text end
       if p.functionCall then
         i = i + 1
         -- Capture the thoughtSignature riding on this functionCall part so it can
@@ -998,21 +1094,22 @@ local function parse_response_tools(provider, data)
         -- Omitting it on replay 400s with "missing a thought_signature". For
         -- parallel calls only the first part carries one; the rest stay nil.
         tools[#tools + 1] = {
-          id = "call_" .. i .. "_" .. (p.functionCall.name or ""),
-          name = p.functionCall.name,
-          input = p.functionCall.args or {},
-          thought_signature = p.thoughtSignature,
+          id = "call_" .. i .. "_" .. jstr(p.functionCall.name),
+          name = jstr(p.functionCall.name),
+          input = (type(p.functionCall.args) == "table") and p.functionCall.args or {},
+          thought_signature = jstr_or_nil(p.thoughtSignature),
         }
-      elseif p.thoughtSignature and p.thoughtSignature ~= "" then
+      else
         -- A signature on a non-functionCall (thinking/text) part. Kept so a
         -- pure-thinking turn can echo it back on its model turn (recommended to
         -- preserve reasoning continuity; not required to avoid the tool-call 400).
-        gemini_sig = p.thoughtSignature
+        local sig = jstr(p.thoughtSignature)
+        if sig ~= "" then gemini_sig = sig end
       end
     end
   elseif provider == "ollama" then
     local msg = data.message or {}
-    text = msg.content or ""
+    text = jstr(msg.content)
     local i = 0
     for _, tc in ipairs(msg.tool_calls or {}) do
       local fn = tc["function"] or {}
@@ -1022,7 +1119,11 @@ local function parse_response_tools(provider, data)
         local ok, parsed = pcall(vim.fn.json_decode, input)
         input = (ok and type(parsed) == "table") and parsed or {}
       end
-      tools[#tools + 1] = { id = "call_" .. i .. "_" .. (fn.name or ""), name = fn.name, input = input or {} }
+      tools[#tools + 1] = {
+        id = "call_" .. i .. "_" .. jstr(fn.name),
+        name = jstr(fn.name),
+        input = (type(input) == "table") and input or {},
+      }
     end
   end
   return text, tools, thinking, gemini_sig, reasoning
@@ -1057,12 +1158,12 @@ local function stream_update(provider, obj, state, emit, emit_thinking)
       if obj.delta.type == "text_delta" and obj.delta.text then
         emit(obj.delta.text)
       elseif obj.delta.type == "thinking_delta" and state.think_blocks[obj.index] then
-        state.think_blocks[obj.index].thinking = state.think_blocks[obj.index].thinking .. (obj.delta.thinking or "")
-        if emit_thinking then emit_thinking(obj.delta.thinking or "") end
+        state.think_blocks[obj.index].thinking = state.think_blocks[obj.index].thinking .. jstr(obj.delta.thinking)
+        emit_thinking(jstr(obj.delta.thinking))
       elseif obj.delta.type == "signature_delta" and state.think_blocks[obj.index] then
-        state.think_blocks[obj.index].signature = (state.think_blocks[obj.index].signature or "") .. (obj.delta.signature or "")
+        state.think_blocks[obj.index].signature = (state.think_blocks[obj.index].signature or "") .. jstr(obj.delta.signature)
       elseif obj.delta.type == "input_json_delta" and state.tool_blocks[obj.index] then
-        state.tool_blocks[obj.index].json = state.tool_blocks[obj.index].json .. (obj.delta.partial_json or "")
+        state.tool_blocks[obj.index].json = state.tool_blocks[obj.index].json .. jstr(obj.delta.partial_json)
       end
     elseif obj.type == "content_block_stop" then
       if state.tool_blocks[obj.index] then
@@ -1075,62 +1176,67 @@ local function stream_update(provider, obj, state, emit, emit_thinking)
     elseif obj.type == "message_delta" and obj.delta then
       -- The final message_delta carries stop_reason ("end_turn" | "tool_use" |
       -- "max_tokens"); capture it so finalize can flag a truncated turn.
-      state.stop_reason = obj.delta.stop_reason or state.stop_reason
+      state.stop_reason = jstr_or_nil(obj.delta.stop_reason) or state.stop_reason
     end
   elseif provider == "openai" then
     local ch = obj.choices and obj.choices[1]
     local delta = ch and ch.delta
     -- finish_reason == "length" means the answer was cut off at the token cap.
-    if ch and ch.finish_reason then state.stop_reason = ch.finish_reason end
+    if ch and type(ch.finish_reason) == "string" then state.stop_reason = ch.finish_reason end
     if delta then
       -- Moonshot/Kimi reasoning models stream chain-of-thought on a separate
       -- delta.reasoning_content channel (before the answer's delta.content).
       -- Accumulate it for replay on a tool-call turn and surface it live as
       -- thinking. Plain OpenAI chat completions never send this field.
-      if delta.reasoning_content and delta.reasoning_content ~= "" then
-        state.reasoning = (state.reasoning or "") .. delta.reasoning_content
-        emit_thinking(delta.reasoning_content)
+      -- jstr() everything: llama.cpp/Qwen sends content/reasoning/arguments as
+      -- JSON null (vim.NIL) on chunks that carry no text, and concatenating that
+      -- userdata onto state.reasoning / slot.json would raise mid-stream.
+      local rc = jstr(delta.reasoning_content)
+      if rc ~= "" then
+        state.reasoning = (state.reasoning or "") .. rc
+        emit_thinking(rc)
       end
-      if delta.content then emit(delta.content) end
+      emit(jstr(delta.content))
       for _, tc in ipairs(delta.tool_calls or {}) do
-        local idx = tc.index or 0
+        local idx = (type(tc.index) == "number") and tc.index or 0
         state.tool_blocks[idx] = state.tool_blocks[idx] or { id = nil, name = nil, json = "" }
         local slot = state.tool_blocks[idx]
-        if tc.id then slot.id = tc.id end
+        if type(tc.id) == "string" then slot.id = tc.id end
         local fn = tc["function"]
         if fn then
-          if fn.name then slot.name = fn.name end
-          if fn.arguments then slot.json = slot.json .. fn.arguments end
+          if type(fn.name) == "string" then slot.name = fn.name end
+          if type(fn.arguments) == "string" then slot.json = slot.json .. fn.arguments end
         end
       end
     end
   elseif provider == "gemini" then
     local cand = obj.candidates and obj.candidates[1]
     -- finishReason == "MAX_TOKENS" means the output was truncated at the cap.
-    if cand and cand.finishReason then state.stop_reason = cand.finishReason end
+    if cand and type(cand.finishReason) == "string" then state.stop_reason = cand.finishReason end
     local parts = cand and cand.content and cand.content.parts or {}
     for _, p in ipairs(parts) do
-      if p.text then emit(p.text) end
+      emit(jstr(p.text))
       if p.functionCall then
         state.tool_list[#state.tool_list + 1] = {
-          id = "call_" .. (#state.tool_list + 1) .. "_" .. (p.functionCall.name or ""),
-          name = p.functionCall.name,
-          input = p.functionCall.args or {},
-          thought_signature = p.thoughtSignature,
+          id = "call_" .. (#state.tool_list + 1) .. "_" .. jstr(p.functionCall.name),
+          name = jstr(p.functionCall.name),
+          input = (type(p.functionCall.args) == "table") and p.functionCall.args or {},
+          thought_signature = jstr_or_nil(p.thoughtSignature),
         }
-      elseif p.thoughtSignature and p.thoughtSignature ~= "" then
+      else
         -- A streaming response may deliver the signature on a standalone part
         -- (empty-text) rather than on the functionCall part. Stash the first one
         -- as a fallback, grafted onto the first tool in finalize_stream_tools.
-        state.gemini_pending_sig = state.gemini_pending_sig or p.thoughtSignature
+        local sig = jstr(p.thoughtSignature)
+        if sig ~= "" then state.gemini_pending_sig = state.gemini_pending_sig or sig end
       end
     end
   elseif provider == "ollama" then
     -- done_reason == "length" means generation stopped at num_predict (truncated).
-    if obj.done_reason then state.stop_reason = obj.done_reason end
+    if type(obj.done_reason) == "string" then state.stop_reason = obj.done_reason end
     local msg = obj.message
     if msg then
-      if msg.content and msg.content ~= "" then emit(msg.content) end
+      emit(jstr(msg.content))
       for _, tc in ipairs(msg.tool_calls or {}) do
         local fn = tc["function"] or {}
         local input = fn.arguments
@@ -1138,7 +1244,11 @@ local function stream_update(provider, obj, state, emit, emit_thinking)
           local ok, parsed = pcall(vim.fn.json_decode, input)
           input = (ok and type(parsed) == "table") and parsed or {}
         end
-        state.tool_list[#state.tool_list + 1] = { id = "call_" .. (#state.tool_list + 1) .. "_" .. (fn.name or ""), name = fn.name, input = input or {} }
+        state.tool_list[#state.tool_list + 1] = {
+          id = "call_" .. (#state.tool_list + 1) .. "_" .. jstr(fn.name),
+          name = jstr(fn.name),
+          input = (type(input) == "table") and input or {},
+        }
       end
     end
   end
@@ -1153,7 +1263,14 @@ local function finalize_stream_tools(provider, state)
     for _, k in ipairs(idxs) do
       local b = state.tool_blocks[k]
       local ok, input = pcall(vim.fn.json_decode, (b.json ~= "" and b.json) or "{}")
-      state.tool_list[#state.tool_list + 1] = { id = b.id, name = b.name, input = (ok and type(input) == "table") and input or {} }
+      -- b.id can be nil when the server (some llama.cpp builds) streams tool calls
+      -- without ids; synthesize a stable one so the assistant tool_calls turn and
+      -- the tool_result both carry the SAME tool_call_id on the continuation.
+      state.tool_list[#state.tool_list + 1] = {
+        id = jstr_or_nil(b.id) or ("call_" .. k .. "_" .. jstr(b.name)),
+        name = jstr(b.name),
+        input = (ok and type(input) == "table") and input or {},
+      }
     end
   elseif provider == "gemini" then
     -- If the signature streamed in on a standalone part rather than on the
@@ -1236,6 +1353,21 @@ You have native tool access to the user's machine via tool/function calls:
 Call these tools using your native tool-calling capability — do NOT print the calls as plain text or markup. You may request several tools in a single turn. Briefly tell the user what you intend to do before calling a tool. The user is asked to approve commands and writes (writes show a diff) unless auto-approve is enabled; file paths outside the project root always require manual approval.
 ]])
 
+  -- 2a. Web tools (only documented when web search is enabled, matching the tool
+  -- schema that active_tool_defs sends).
+  do
+    local ws = settings.web_search
+    if (ws == nil) or (ws.enabled ~= false and ws.provider ~= "disabled") then
+      table.insert(system_parts, [[
+You can also access the public web (these run automatically, no approval needed):
+- `web_search` — search the web; returns a numbered list of {title, URL, snippet}
+- `fetch_url` — fetch one web page (or PDF) and read its main content as clean markdown
+
+For anything beyond this codebase — current events, library/API docs, latest versions, unfamiliar errors or tools — use `web_search`, then `fetch_url` on the most relevant result to read it in full, and CITE the source URLs in your answer. Prefer fetched page content over snippets, and note when results look outdated or insufficient.
+]])
+    end
+  end
+
   -- 2b. Plan mode (toggled with /plan): require a plan before any mutation.
   if opts.plan_mode then
     table.insert(system_parts, [[
@@ -1309,6 +1441,8 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
   local headers = { ["Content-Type"] = "application/json" }
   local payload = {}
   local append_user = not opts.is_tool_continuation
+  -- Tool list for this request: drops web_search/fetch_url when web search is off.
+  local tool_defs = active_tool_defs(settings)
 
   if provider == "gemini" then
     local gen_config = { temperature = final_temp }
@@ -1319,14 +1453,14 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
       contents = build_gemini_contents(pruned_history, processed_prompt, append_user),
       systemInstruction = { parts = { { text = system_prompt } } },
       generationConfig = gen_config,
-      tools = gemini_tools(),
+      tools = gemini_tools(tool_defs),
     }
   elseif provider == "openai" then
     headers["Authorization"] = "Bearer " .. api_key
     payload = {
       model = clean_model,
       messages = build_openai_messages(pruned_history, system_prompt, processed_prompt, append_user),
-      tools = openai_tools(),
+      tools = openai_tools(tool_defs),
     }
     if openai_is_reasoning(clean_model) then
       payload.max_completion_tokens = 16384
@@ -1346,7 +1480,7 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
       -- "invalid temperature: only 1 is allowed for this model".
       temperature = 1,
       messages = build_openai_messages(pruned_history, system_prompt, processed_prompt, append_user, true),
-      tools = openai_tools(),
+      tools = openai_tools(tool_defs),
     }
     -- The -low/-medium/-high picker suffix maps to reasoning_effort. Accepted
     -- values are minimal/low/medium/high; reasoning cannot be disabled this way.
@@ -1366,7 +1500,7 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
       -- System as a content block with a prompt-cache breakpoint (stable prefix).
       system = { { type = "text", text = system_prompt, cache_control = { type = "ephemeral" } } },
       messages = build_anthropic_messages(pruned_history, processed_prompt, append_user),
-      tools = anthropic_tools(),
+      tools = anthropic_tools(tool_defs),
     }
     if effort and anthropic_supports_effort(clean_model) then
       -- display="summarized" surfaces reasoning text (default "omitted" streams
@@ -1390,14 +1524,14 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
       -- the OpenAI schema requires it to be present and non-empty.
       model = (clean_model ~= "" and clean_model) or "local-model",
       messages = build_openai_messages(pruned_history, system_prompt, processed_prompt, append_user),
-      tools = openai_tools(),
+      tools = openai_tools(tool_defs),
       temperature = final_temp,
     }
   elseif provider == "ollama" then
     payload = {
       model = clean_model,
       messages = build_ollama_messages(pruned_history, system_prompt, processed_prompt, append_user),
-      tools = openai_tools(),
+      tools = openai_tools(tool_defs),
       stream = false,
       options = { temperature = final_temp },
     }
@@ -1422,8 +1556,14 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
     local started = false
     local acc = {}
     local sstate = { tool_blocks = {}, tool_list = {}, think_blocks = {}, think_list = {} }
+    -- The type guard (not just `text == ""`) is load-bearing: a JSON-null delta
+    -- decodes to vim.NIL (userdata, truthy, ~= ""), and llama.cpp/Qwen sends
+    -- `content: null` on its role-priming / tool_call / final chunks. Letting it
+    -- past here put userdata into `acc`, and the table.concat(acc) at finalize
+    -- raised "invalid value (userdata) ... for 'concat'", discarding the whole
+    -- turn (and its tool calls). This is the single choke point for the stream.
     local function emit(text)
-      if not text or text == "" then return end
+      if type(text) ~= "string" or text == "" then return end
       if not started then
         started = true
         if opts.on_response_start then opts.on_response_start() end
@@ -1432,7 +1572,7 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
       if opts.on_delta then opts.on_delta(text) end
     end
     local function emit_thinking(text)
-      if not text or text == "" then return end
+      if type(text) ~= "string" or text == "" then return end
       if opts.on_thinking then opts.on_thinking(text) end
     end
     local function on_line(_, line)
@@ -1738,6 +1878,32 @@ function M.send_prompt(opts, callback)
             opts.notify_fn(string.format("\n> **System**: Remembering: %s\n", tostring(tool_arg)))
           end
           M.execute_tool(tool_type, tool_arg, function(output)
+            table.insert(results, { id = tc.id, name = tc.name, output = output })
+            process(i + 1)
+          end, opts)
+          return
+        end
+
+        -- Web tools are read-only network reads — they never touch the filesystem
+        -- or run a shell command, so they always auto-run (no approval), like
+        -- save_memory but async. The full result reaches the model via `results`;
+        -- the chat gets a compact collapsible card.
+        if tool_type == "web_search" or tool_type == "fetch_url" then
+          if tool_type == "web_search" then
+            emit_status(opts, "searching", status_label(tool_arg.query))
+          else
+            emit_status(opts, "fetching", status_label(tool_arg.url))
+          end
+          M.execute_tool(tool_type, tool_arg, function(output)
+            if opts.notify_fn then
+              local summary
+              if tool_type == "web_search" then
+                summary = string.format("> 🌐 searched `%s`", status_label(tool_arg.query, 60))
+              else
+                summary = string.format("> 🌐 fetched `%s` (%d chars)", status_label(tool_arg.url, 60), #(output or ""))
+              end
+              opts.notify_fn(fold_card(summary, output))
+            end
             table.insert(results, { id = tc.id, name = tc.name, output = output })
             process(i + 1)
           end, opts)

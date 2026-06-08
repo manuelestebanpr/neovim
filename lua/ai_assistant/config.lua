@@ -56,6 +56,9 @@ local TOTAL_CONTEXT_CAP = 256 * 1024
 local DEEP_MERGE_KEYS = {
   api_keys = true,
   agents = true,
+  -- Deep-merged so new sub-keys (a freshly added backend, a new tunable) appear
+  -- for users who already have a saved web_search block from an earlier version.
+  web_search = true,
 }
 
 local default_settings = {
@@ -112,6 +115,25 @@ local default_settings = {
     -- Only needed if llama-server was started with `--api-key`; left blank,
     -- requests go out unauthenticated (the common local setup).
     llamacpp = "",
+  },
+  -- Web access for the agent. Exposes the `web_search` + `fetch_url` native tools
+  -- to EVERY provider (the local llama.cpp model included). The default backend
+  -- needs no API key: a self-hosted SearXNG (run it on `searxng_url` with JSON
+  -- output enabled), falling back to keyless DuckDuckGo. Add a Tavily/Serper/Brave
+  -- key below for more reliable results. Keys also read from the env vars
+  -- TAVILY_API_KEY / SERPER_API_KEY / BRAVE_API_KEY / JINA_API_KEY (env wins).
+  web_search = {
+    enabled = true,
+    -- "auto" | "searxng" | "tavily" | "serper" | "brave" | "duckduckgo" | "disabled".
+    -- "auto" tries any key-based backend whose key is set, then SearXNG, then
+    -- DuckDuckGo as a keyless last resort.
+    provider = "auto",
+    searxng_url = "http://127.0.0.1:8080",
+    max_results = 5,
+    -- Hard cap on the characters fetch_url returns for a single page (keeps a big
+    -- page from blowing a small local model's context).
+    fetch_char_cap = 10000,
+    api_keys = { tavily = "", serper = "", brave = "", jina = "" },
   },
   user_context = {
     { id = "developer_profile", text = "I am a full stack software engineer." },
@@ -265,13 +287,48 @@ function M.get_api_key(settings, provider)
     end
   end
   if settings and settings.api_keys then
-    return settings.api_keys[provider] or ""
+    -- A key stored as JSON null decodes to vim.NIL (userdata, truthy), so a bare
+    -- `... or ""` would return the userdata, which later crashes the unguarded
+    -- `"Bearer " .. api_key` / `?key=" .. api_key` concatenations in api.lua with
+    -- "attempt to concatenate a userdata value". Only a real string is a key.
+    local key = settings.api_keys[provider]
+    if type(key) == "string" then return key end
   end
   return ""
 end
 
 function M.get_env_key_name(provider)
   return ENV_KEYS[provider]
+end
+
+-- Web-search backend keys live under settings.web_search.api_keys, with an env-var
+-- fallback (env wins, same as get_api_key). Returns only a real string ("" if
+-- unset / stored as JSON null -> vim.NIL) so callers can safely concat it.
+local SEARCH_ENV_KEYS = {
+  tavily = "TAVILY_API_KEY",
+  serper = "SERPER_API_KEY",
+  brave = "BRAVE_API_KEY",
+  jina = "JINA_API_KEY",
+}
+
+function M.get_search_key(settings, name)
+  local env_name = SEARCH_ENV_KEYS[name]
+  if env_name then
+    local env_val = vim.env[env_name]
+    if env_val and env_val ~= "" then
+      return env_val
+    end
+  end
+  local ws = settings and settings.web_search
+  if ws and ws.api_keys then
+    local key = ws.api_keys[name]
+    if type(key) == "string" then return key end
+  end
+  return ""
+end
+
+function M.get_search_env_key_name(name)
+  return SEARCH_ENV_KEYS[name]
 end
 
 -- Normalized base URL of the local llama.cpp server. Trailing slashes are

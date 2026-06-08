@@ -27,6 +27,8 @@ local PHASES = {
   writing_file = { icon = "✎",  label = "Writing file",       hint = nil },
   remember     = { icon = "💾", label = "Saving memory",      hint = nil },
   delegating   = { icon = "↪",  label = "Delegating",         hint = nil },
+  searching    = { icon = "🌐", label = "Searching the web",  hint = nil },
+  fetching     = { icon = "🌐", label = "Fetching page",      hint = nil },
 }
 
 -- Foldtext for the collapsible "cards" (tool output, diffs, reasoning). Shows the
@@ -529,7 +531,102 @@ local function view_user_context()
   end)
 end
 
-local function configure_api_keys()
+-- Forward-declared so configure_web_search (defined first) can route "Back" to
+-- it, while configure_api_keys opens configure_web_search.
+local configure_api_keys
+
+-- Web access config: pick the search backend, set the SearXNG URL, toggle web
+-- search on/off, and store optional Tavily/Serper/Brave/Jina keys. The
+-- web_search/fetch_url tools work keyless (SearXNG -> DuckDuckGo) out of the box;
+-- keys here unlock the more reliable backends.
+local function configure_web_search()
+  local Menu = require("nui.menu")
+  local event = require("nui.utils.autocmd").event
+  local settings = config.load_settings()
+  local ws = settings.web_search or {}
+
+  local PROVIDERS = { "auto", "searxng", "tavily", "serper", "brave", "duckduckgo", "disabled" }
+  local function key_state(name)
+    return (config.get_search_key(settings, name) ~= "") and "set" or "unset"
+  end
+
+  local lines = {
+    Menu.item("< Back to Providers", { id = "back" }),
+    Menu.separator("Backend"),
+    Menu.item("Provider: " .. tostring(ws.provider or "auto"), { id = "provider" }),
+    Menu.item("SearXNG URL: " .. tostring(ws.searxng_url or "http://127.0.0.1:8080"), { id = "searxng_url" }),
+    Menu.item("Enabled: " .. ((ws.enabled ~= false) and "ON" or "OFF"), { id = "toggle" }),
+    Menu.separator("Optional API Keys"),
+    Menu.item("Tavily key (" .. key_state("tavily") .. ")", { id = "tavily" }),
+    Menu.item("Serper key (" .. key_state("serper") .. ")", { id = "serper" }),
+    Menu.item("Brave key (" .. key_state("brave") .. ")", { id = "brave" }),
+    Menu.item("Jina key — fetch_url (" .. key_state("jina") .. ")", { id = "jina" }),
+  }
+
+  local menu = Menu({
+    position = "50%",
+    size = { width = 54, height = math.min(16, #lines + 2) },
+    border = { style = "rounded", text = { top = " Web Search ", top_align = "center" } },
+    buf_options = { modifiable = true, readonly = false },
+    win_options = { winhighlight = "Normal:Normal,FloatBorder:FloatBorder" },
+  }, {
+    lines = lines,
+    on_submit = function(item)
+      if item.id == "back" then
+        configure_api_keys()
+        return
+      end
+      local s = config.load_settings()
+      s.web_search = s.web_search or {}
+      s.web_search.api_keys = s.web_search.api_keys or {}
+      if item.id == "provider" then
+        vim.ui.select(PROVIDERS, { prompt = "Web search provider:" }, function(choice)
+          if choice then
+            s.web_search.provider = choice
+            config.save_settings(s)
+            vim.notify("AI Assistant: web search provider = " .. choice, vim.log.levels.INFO)
+          end
+          configure_web_search()
+        end)
+        return
+      elseif item.id == "searxng_url" then
+        local url = vim.fn.input("SearXNG URL: ", s.web_search.searxng_url or "http://127.0.0.1:8080")
+        if url ~= "" then
+          s.web_search.searxng_url = url
+          config.save_settings(s)
+          vim.notify("AI Assistant: SearXNG URL set to " .. url, vim.log.levels.INFO)
+        end
+        configure_web_search()
+        return
+      elseif item.id == "toggle" then
+        -- enabled defaults to true; flip the effective value.
+        s.web_search.enabled = not (s.web_search.enabled ~= false)
+        config.save_settings(s)
+        vim.notify("AI Assistant: web search " .. (s.web_search.enabled and "ENABLED" or "DISABLED"), vim.log.levels.INFO)
+        configure_web_search()
+        return
+      else
+        -- A key backend: tavily / serper / brave / jina. Blank keeps the current
+        -- value so Esc doesn't wipe a stored key (same as the provider menu).
+        local key = vim.fn.inputsecret(string.format("Enter %s API key (blank = keep current): ", item.id))
+        if key ~= "" then
+          s.web_search.api_keys[item.id] = key
+          config.save_settings(s)
+          vim.notify("AI Assistant: " .. item.id .. " key saved.", vim.log.levels.INFO)
+        end
+        configure_web_search()
+        return
+      end
+    end,
+  })
+
+  menu:mount()
+  menu:on(event.BufLeave, function()
+    menu:unmount()
+  end)
+end
+
+function configure_api_keys()
   local Menu = require("nui.menu")
   local event = require("nui.utils.autocmd").event
 
@@ -545,6 +642,8 @@ local function configure_api_keys()
     Menu.item("Moonshot (Kimi)", { id = "moonshot" }),
     Menu.item("Ollama (Local)", { id = "ollama" }),
     Menu.item("llama.cpp (llama-server)", { id = "llamacpp" }),
+    Menu.separator("Web Access"),
+    Menu.item("Web Search (backend + keys)", { id = "web_search" }),
   }
 
   local menu = Menu({
@@ -561,6 +660,10 @@ local function configure_api_keys()
     on_submit = function(item)
       if item.id == "back" then
         M.manage_context()
+        return
+      end
+      if item.id == "web_search" then
+        configure_web_search()
         return
       end
       -- llama-server is local: configure its URL (port) plus an optional bearer
