@@ -70,30 +70,33 @@ end, { desc = "Which-Key: Buffer Local Keymaps" })
 -- The sub-keys are sequential (a..j) on purpose: which-key sorts entries
 -- alphanumerically, so this keeps the list in a clean, grouped reading order.
 -- =============================================================================
-local function cheat(desc)
-  -- Explicit no-op: which-key v3 needs a real rhs for label-only entries,
-  -- otherwise the mapping can behave unpredictably after buffer switches.
-  return { desc = desc, icon = "󰋽 " }
+-- Build a reference-only cheat-sheet entry: a <Nop> mapping (truly does nothing
+-- when pressed) that carries a label + icon. which-key v3 only reads positional
+-- [1]=lhs and [2]=rhs; desc/icon MUST be named fields (a table at index [3] is
+-- parsed as a child mapping and silently dropped), and the rhs must be a real
+-- no-op -- the previous vim.notify rhs ERRORED when the chord was pressed.
+local function cheat(lhs, desc)
+  return { lhs, "<Nop>", desc = desc, icon = "󰋽 " }
 end
 
 wk.add({
   { "<leader>k", group = "Cheat-sheet (custom keys)" },
 
   -- Harpoon -- quick file jump list (lua/plugins/harpoon.lua)
-  { "<leader>ka", vim.notify, cheat("[Ctrl-e]  Harpoon: Toggle Quick Menu") },
-  { "<leader>kb", vim.notify, cheat("[Ctrl-h]  Harpoon: Go to File 1") },
-  { "<leader>kc", vim.notify, cheat("[Ctrl-t]  Harpoon: Go to File 2") },
-  { "<leader>kd", vim.notify, cheat("[Ctrl-n]  Harpoon: Go to File 3") },
-  { "<leader>ke", vim.notify, cheat("[Ctrl-s]  Harpoon: Go to File 4") },
+  cheat("<leader>ka", "[Ctrl-e]  Harpoon: Toggle Quick Menu"),
+  cheat("<leader>kb", "[Ctrl-h]  Harpoon: Go to File 1"),
+  cheat("<leader>kc", "[Ctrl-t]  Harpoon: Go to File 2"),
+  cheat("<leader>kd", "[Ctrl-n]  Harpoon: Go to File 3"),
+  cheat("<leader>ke", "[Ctrl-s]  Harpoon: Go to File 4"),
 
   -- Scrolling -- keeps the cursor centered (lua/config/remap.lua)
-  { "<leader>kf", vim.notify, cheat("[Ctrl-d]  Scroll Half-Page Down (centered)") },
-  { "<leader>kg", vim.notify, cheat("[Ctrl-u]  Scroll Half-Page Up (centered)") },
+  cheat("<leader>kf", "[Ctrl-d]  Scroll Half-Page Down (centered)"),
+  cheat("<leader>kg", "[Ctrl-u]  Scroll Half-Page Up (centered)"),
 
   -- Visual mode line moves (lua/config/remap.lua)
-  { "<leader>kh", vim.notify, cheat("[J] in visual mode  Move Selection Down") },
-  { "<leader>ki", vim.notify, cheat("[K] in visual mode  Move Selection Up") },
+  cheat("<leader>kh", "[J] in visual mode  Move Selection Down"),
+  cheat("<leader>ki", "[K] in visual mode  Move Selection Up"),
 
   -- Pointer to the buffer-local LSP / JDTLS maps (Java files only)
-  { "<leader>kj", vim.notify, cheat("Java / LSP keys -> press <leader>? inside a .java buffer") },
+  cheat("<leader>kj", "Java / LSP keys -> press <leader>? inside a .java buffer"),
 })
