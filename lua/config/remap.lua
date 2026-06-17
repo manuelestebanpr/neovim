@@ -58,14 +58,19 @@ vim.keymap.set("n", "<leader>psr", function()
 end, {desc = "Resume Last Search"})
 
 vim.api.nvim_create_autocmd('FileType', {
-  pattern = 'java',
-  callback = function()
+  -- Trigger on java AND xml: opening a Hybris config/items/beans xml should also
+  -- boot the jdtls workspace so it is warm by the time you jump to a .java file.
+  pattern = { 'java', 'xml' },
+  callback = function(args)
+    local ft = vim.bo[args.buf].filetype
     local utils = require('jdtls.utils')
     local project_type, root_dir = utils.detect_project()
 
     if project_type == 'hybris' then
       require('jdtls.hybris_setup').setup(root_dir)
-    else
+    elseif ft == 'java' then
+      -- Normal Maven/Gradle project: only Java buffers start jdtls; a stray xml
+      -- file outside a Hybris tree should not spin up a Java language server.
       require('jdtls.jdtls_setup').setup(root_dir)
     end
   end

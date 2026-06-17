@@ -90,36 +90,64 @@ function M.get_lombok_jar(jdtls_root)
 end
 
 
--- Detect if we are inside a Hybris project or normal Maven/Gradle project
+-- Walk upward from `start_path` (inclusive) and return the first ancestor
+-- directory that CONTAINS one of the given marker sub-paths.
+--
+-- NOTE: this intentionally does NOT use `vim.fs.root`. `vim.fs.root` returns
+-- `dirname(<matched marker>)`, which is only correct for single-segment markers
+-- such as ".git". For a multi-segment marker like "bin/platform" the match is
+-- ".../hybris/bin/platform" and its dirname is ".../hybris/bin" -- i.e. the
+-- marker's parent, NOT the project root ".../hybris". That off-by-one is what
+-- makes Hybris detection resolve to ".../hybris/bin" and then fail the
+-- ".../hybris/bin/bin/platform" check. We resolve the root ourselves so
+-- multi-segment markers work correctly.
+local function find_ancestor_containing(start_path, markers)
+  local uv = vim.uv or vim.loop
+  local dir = vim.fn.fnamemodify(start_path, ":p"):gsub("/+$", "")
+  if dir == "" then dir = "/" end -- a marker living at the filesystem root
+  while dir and dir ~= "" do
+    for _, sub in ipairs(markers) do
+      if uv.fs_stat(dir .. "/" .. sub) then
+        return dir
+      end
+    end
+    local parent = vim.fs.dirname(dir)
+    if not parent or parent == dir then break end
+    dir = parent
+  end
+  return nil
+end
+
+-- Detect whether we are inside a Hybris project or a normal Maven/Gradle one.
+-- Returns: project_type ("hybris" | "normal"), root_dir (absolute path)
 function M.detect_project()
   local buf_name = vim.api.nvim_buf_get_name(0)
   local start_path = (buf_name ~= "") and vim.fs.dirname(buf_name) or vim.fn.getcwd()
 
-  -- 1. Search upwards for Hybris markers (e.g. bin/platform, bin/custom)
-  local hybris_indicator = vim.fs.root(start_path, {
-    'bin/platform',
-    'config/localextensions.xml',
-    'bin/custom'
+  -- 1. Hybris: the root is the directory that directly contains bin/platform.
+  --    (bin/custom and config/localextensions.xml resolve to the same root.)
+  local hybris_root = find_ancestor_containing(start_path, {
+    "bin/platform",
+    "config/localextensions.xml",
+    "bin/custom",
   })
-
-  if hybris_indicator then
-    return 'hybris', hybris_indicator
+  if hybris_root then
+    return "hybris", hybris_root
   end
 
-  -- 2. Search upwards for normal Maven/Gradle/Git markers
-  local normal_indicator = vim.fs.root(start_path, {
-    'pom.xml',
-    'build.gradle',
-    'gradlew',
-    'mvnw',
-    '.git'
+  -- 2. Normal Maven/Gradle/Git project.
+  local normal_root = find_ancestor_containing(start_path, {
+    "pom.xml",
+    "build.gradle",
+    "gradlew",
+    "mvnw",
+    ".git",
   })
-
-  if normal_indicator then
-    return 'normal', normal_indicator
+  if normal_root then
+    return "normal", normal_root
   end
 
-  return 'normal', vim.fn.getcwd()
+  return "normal", vim.fn.getcwd()
 end
 
 -- Bind standard LSP and JDTLS-specific keymaps buffer-locally

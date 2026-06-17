@@ -13,9 +13,13 @@ local function init_paths(hybris_root)
   if CONF.HYBRIS_ROOT then return end
 
   if not hybris_root then
-    local env_root = vim.env.HYBRIS_HOME_DIR
-    if env_root then
-      hybris_root = env_root .. "/hybris"
+    if vim.env.HYBRIS_HOME_DIR and vim.env.HYBRIS_HOME_DIR ~= "" then
+      hybris_root = vim.env.HYBRIS_HOME_DIR .. "/hybris"
+    elseif vim.env.PLATFORM_HOME and vim.env.PLATFORM_HOME ~= "" then
+      -- PLATFORM_HOME points at <root>/bin/platform (set by setantenv); strip
+      -- the trailing "/bin/platform" to recover the Hybris root <root>.
+      local ph = vim.env.PLATFORM_HOME:gsub("/+$", "")
+      hybris_root = vim.fn.fnamemodify(ph, ":h:h")
     else
       local _, root = utils.detect_project()
       hybris_root = root
@@ -62,6 +66,102 @@ local function read_file_content(path)
   local content = f:read("*a")
   f:close()
   return content
+end
+
+-- Directories that never hold a Hybris extension root but are expensive to walk.
+local SKIP_DIRS = {
+  ["node_modules"] = true,
+  ["bower_components"] = true,
+  [".git"] = true,
+  [".svn"] = true,
+  ["dist"] = true,
+  ["build"] = true,
+  ["classes"] = true,
+  ["testclasses"] = true,
+}
+
+-- Pure-Lua recursive fallback, used only when `fd` is unavailable. Collects every
+-- extensioninfo.xml under `dir`. Prunes once an extension root is found (Hybris
+-- extensions are siblings, never nested inside one another), skips heavy
+-- build/vendor directories, and follows symlinks via fs_stat with a depth cap as
+-- a loop guard.
+local function scan_extensioninfo(dir, acc, depth, seen)
+  acc = acc or {}
+  depth = depth or 0
+  seen = seen or {}
+  if depth > 40 then return acc end -- shallow trees in practice; just a backstop
+
+  local uv = vim.uv or vim.loop
+
+  -- Guard against symlink cycles by tracking canonical (resolved) paths.
+  local real = uv.fs_realpath(dir)
+  if real then
+    if seen[real] then return acc end
+    seen[real] = true
+  end
+
+  local handle = uv.fs_scandir(dir)
+  if not handle then return acc end
+
+  local subdirs = {}
+  local found_here = false
+  while true do
+    local name, typ = uv.fs_scandir_next(handle)
+    if not name then break end
+    local full = dir .. "/" .. name
+    if name == "extensioninfo.xml" then
+      table.insert(acc, full)
+      found_here = true
+    elseif not SKIP_DIRS[name] then
+      if typ == nil or typ == "link" then
+        local st = uv.fs_stat(full)
+        typ = st and st.type or nil
+      end
+      if typ == "directory" then
+        table.insert(subdirs, full)
+      end
+    end
+  end
+
+  if not found_here then
+    for _, sub in ipairs(subdirs) do
+      scan_extensioninfo(sub, acc, depth + 1, seen)
+    end
+  end
+  return acc
+end
+
+-- Locate every extensioninfo.xml under <bin_dir>. Prefers `fd` (fast, parallel,
+-- symlink-aware) and falls back to the pure-Lua scan above. Returns a list of
+-- absolute paths.
+local function find_extensioninfo_files(bin_dir)
+  if vim.fn.executable("fd") == 1 then
+    -- List form => run without a shell: no quoting/word-splitting pitfalls and
+    -- no stray extra search path. -L follows symlinks, -a yields absolute paths,
+    -- and the regex is anchored to the exact filename.
+    local results = vim.fn.systemlist({
+      "fd", "-L", "-t", "f", "-a", "--", "^extensioninfo\\.xml$", bin_dir,
+    })
+    if vim.v.shell_error == 0 and #results > 0 then
+      return results
+    end
+  end
+  return scan_extensioninfo(bin_dir)
+end
+
+-- Build STATE.name_to_path: every extension directory keyed by its name. Returns
+-- the number of extensions discovered.
+local function build_extension_map()
+  STATE.name_to_path = {}
+  local files = find_extensioninfo_files(CONF.HYBRIS_ROOT .. "/bin")
+  for _, xml_path in ipairs(files) do
+    if xml_path ~= "" and xml_path:match("extensioninfo%.xml$") then
+      local ext_path = vim.fs.dirname(xml_path)
+      local ext_name = vim.fn.fnamemodify(ext_path, ":t")
+      STATE.name_to_path[ext_name] = ext_path
+    end
+  end
+  return vim.tbl_count(STATE.name_to_path)
 end
 
 -- =============================================================================
@@ -116,16 +216,25 @@ end
 -- 4. CLASSPATH INJECTION
 -- =============================================================================
 
+-- True when an extension lives under the custom directory, whether that is the
+-- standard "<root>/bin/custom" or a symlinked physical location (REAL_CUSTOM_PATH).
+-- Boundary-aware: a sibling like "<root>/bin/customaddons" must NOT match.
+local function is_custom_extension(ext_path)
+  if not ext_path then return false end
+  if ext_path:find("/bin/custom/", 1, true) then
+    return true
+  end
+  if REAL_CUSTOM_PATH and ext_path:sub(1, #REAL_CUSTOM_PATH + 1) == REAL_CUSTOM_PATH .. "/" then
+    return true
+  end
+  return false
+end
+
 local function update_classpath(ext_name, dependencies)
   local ext_path = STATE.name_to_path[ext_name]
   if not ext_path then return end
 
-  --  Standard: Path contains "/bin/custom/" anywhere
-  --  Linked: Path matches the resolved physical custom path
-  local is_standard_custom = ext_path:find("/bin/custom/", 1, true)
-  local is_linked_custom = REAL_CUSTOM_PATH and ext_path:find(REAL_CUSTOM_PATH, 1, true)
-
-  if not (is_standard_custom or is_linked_custom) then return end
+  if not is_custom_extension(ext_path) then return end
 
   local classpath_file = ext_path .. "/.classpath"
   if vim.fn.filereadable(classpath_file) == 0 then return end
@@ -187,16 +296,10 @@ local function prepare_workspace()
   STATE.processed_exts = {}
   STATE.name_to_path = {}
 
-  -- 1. Build Global Map: Find ALL extensions in /bin (recursively)
-  -- This creates a master list of every available extension in the system.
-  local cmd = string.format("fd -L -t f -F 'extensioninfo.xml' --absolute-path . %s/bin", CONF.HYBRIS_ROOT)
-  local results = vim.fn.systemlist(cmd)
-
-  for _, xml_path in ipairs(results) do
-    local ext_path = vim.fs.dirname(xml_path)
-    local ext_name = vim.fn.fnamemodify(ext_path, ":t")
-    STATE.name_to_path[ext_name] = ext_path
-  end
+  -- 1. Build Global Map: find ALL extensions under /bin (recursively).
+  -- This master list lets us resolve any requires-extension dependency by name.
+  local ext_count = build_extension_map()
+  vim.notify(string.format("Discovered %d extensions under bin/.", ext_count), vim.log.levels.INFO)
 
   -- 2. PASS 1: Force Load ALL Custom Extensions & Inject Classpaths
   -- We iterate the map first to ensure everything in /custom/ is added to the workspace,
@@ -204,12 +307,9 @@ local function prepare_workspace()
   vim.notify("Scanning and Injecting Classpaths for ALL Custom Extensions...", vim.log.levels.INFO)
 
   for name, path in pairs(STATE.name_to_path) do
-    local is_standard_custom = path:find("/bin/custom/", 1, true)
-    local is_linked_custom = REAL_CUSTOM_PATH and path:find(REAL_CUSTOM_PATH, 1, true)
-
-    if is_standard_custom or is_linked_custom then
+    if is_custom_extension(path) then
       -- 1. Calculate dependencies specifically for this extension
-      local custom_deps = {} 
+      local custom_deps = {}
 
       -- 2. Add to workspace (and recursive dependencies) if not already present
       resolve_dependencies_recursive(name, custom_deps)
@@ -341,8 +441,19 @@ function M.restore_backups()
     vim.notify("Could not resolve Hybris root directory. Ensure you are in a Hybris project.", vim.log.levels.ERROR)
     return
   end
-  local cmd = string.format("fd -L -H -t f '.classpath.nvim_bak$' --absolute-path %s", CONF.HYBRIS_ROOT)
-  local backups = vim.fn.systemlist(cmd)
+  local search_dir = CONF.HYBRIS_ROOT .. "/bin"
+  if vim.fn.isdirectory(search_dir) == 0 then search_dir = CONF.HYBRIS_ROOT end
+
+  local backups
+  if vim.fn.executable("fd") == 1 then
+    backups = vim.fn.systemlist({
+      "fd", "-L", "-H", "-t", "f", "-a", "--", "\\.classpath\\.nvim_bak$", search_dir,
+    })
+    if vim.v.shell_error ~= 0 then backups = {} end
+  else
+    backups = vim.fn.glob(search_dir .. "/**/.classpath.nvim_bak", true, true)
+  end
+
   if #backups == 0 then
     vim.notify("No .classpath backups found to restore.", vim.log.levels.INFO)
     return
