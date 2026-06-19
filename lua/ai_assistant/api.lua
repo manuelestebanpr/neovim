@@ -86,17 +86,18 @@ end
 
 -- Fallback lists used only when live /v1/models discovery returns nothing
 -- (no API key / offline). Sourced from config.MODELS (single source of truth);
--- deep-copied because fetch_available_models sorts these in place.
+-- deep-copied because fetch_available_models sorts these in place. Kimi + Claude
+-- lead per the ordering requirement; OpenAI is dropped as a selectable provider
+-- (its message/stream/parse code is still the shared WIRE for moonshot + llamacpp).
 local DEFAULT_MODELS = {
-  gemini = vim.deepcopy(config.MODELS.gemini),
-  openai = vim.deepcopy(config.MODELS.openai),
-  anthropic = vim.deepcopy(config.MODELS.anthropic),
   moonshot = vim.deepcopy(config.MODELS.moonshot),
+  anthropic = vim.deepcopy(config.MODELS.anthropic),
+  gemini = vim.deepcopy(config.MODELS.gemini),
 }
 
 function M.get_default_models()
   local combined = {}
-  for _, list in pairs({ DEFAULT_MODELS.gemini, DEFAULT_MODELS.anthropic, DEFAULT_MODELS.openai, DEFAULT_MODELS.moonshot }) do
+  for _, list in ipairs({ DEFAULT_MODELS.moonshot, DEFAULT_MODELS.anthropic, DEFAULT_MODELS.gemini }) do
     for _, m in ipairs(list) do
       table.insert(combined, m)
     end
@@ -111,15 +112,22 @@ end
 function M.fetch_available_models(callback)
   local settings = config.load_settings()
   local curl = require("plenary.curl")
-  local results = { gemini = {}, anthropic = {}, openai = {}, moonshot = {}, ollama = {}, llamacpp = {} }
+  local results = { gemini = {}, anthropic = {}, moonshot = {}, ollama = {}, llamacpp = {} }
   local pending = 0
   local done = false
 
   local function finalize()
     if done then return end
     done = true
+    -- Ordering requirement: local LLMs (llama.cpp / ollama) appear FIRST, but only
+    -- when their server is reachable ("enabled" = discovery returned models); then
+    -- Kimi + Claude, then Gemini.
+    local order = {}
+    if #results.llamacpp > 0 then order[#order + 1] = "llamacpp" end
+    if #results.ollama > 0 then order[#order + 1] = "ollama" end
+    for _, p in ipairs({ "moonshot", "anthropic", "gemini" }) do order[#order + 1] = p end
     local seen, ordered = {}, {}
-    for _, provider in ipairs({ "gemini", "anthropic", "openai", "moonshot", "ollama", "llamacpp" }) do
+    for _, provider in ipairs(order) do
       local list = results[provider]
       if #list == 0 and DEFAULT_MODELS[provider] then
         list = DEFAULT_MODELS[provider]
@@ -204,24 +212,6 @@ function M.fetch_available_models(callback)
             end
             if supports_gen and (id:match("^gemini") or id:match("^gemma")) then
               table.insert(out.gemini, id)
-            end
-          end
-        end
-      end,
-    })
-  end
-
-  local openai_key = config.get_api_key(settings, "openai")
-  if openai_key ~= "" then
-    request({
-      url = "https://api.openai.com/v1/models",
-      headers = { Authorization = "Bearer " .. openai_key },
-      parse = function(decoded, out)
-        if decoded.data then
-          for _, m in ipairs(decoded.data) do
-            local id = m.id or ""
-            if id:match("^gpt") or id:match("^o[134]") then
-              table.insert(out.openai, id)
             end
           end
         end
@@ -361,48 +351,6 @@ function M.is_command_denied(command, settings)
 end
 
 ----------------------------------------------------------------------
--- Tool-Call Parsing (Ignoring Fences)
-----------------------------------------------------------------------
-
-function M.parse_tool_call(text)
-  if not text then return nil end
-
-  -- 1. WRITE_FILE block (multi-line). Markers must appear unfenced.
-  do
-    local path, content = text:match("%[WRITE_FILE:%s*([^%]]+)%]\n(.-)\n%[END_WRITE%]")
-    if path and content then
-      local idx = text:find("%[WRITE_FILE:", 1, false)
-      if idx then
-        local prefix = text:sub(1, idx - 1)
-        local _, fences = prefix:gsub("```", "")
-        if fences % 2 == 0 then
-          return { type = "write_file", path = vim.trim(path), content = content }
-        end
-      end
-    end
-  end
-
-  -- 2. Single-line directives (RUN_COMMAND / READ_FILE), skipping fences.
-  local in_fence = false
-  for line in (text .. "\n"):gmatch("(.-)\n") do
-    if line:match("^%s*```") then
-      in_fence = not in_fence
-    elseif not in_fence then
-      local cmd = line:match("^%s*%[RUN_COMMAND%]%s*(.+)$")
-      if cmd and vim.trim(cmd) ~= "" then
-        return { type = "command", arg = vim.trim(cmd) }
-      end
-      local rf = line:match("^%s*%[READ_FILE%]%s*(.+)$")
-      if rf and vim.trim(rf) ~= "" then
-        return { type = "read_file", arg = vim.trim(rf) }
-      end
-    end
-  end
-
-  return nil
-end
-
-----------------------------------------------------------------------
 -- Write diff (shared by the auto-write card and the review popup)
 ----------------------------------------------------------------------
 
@@ -490,9 +438,28 @@ function M.execute_tool(tool_type, tool_arg, on_complete, opts)
     end)
     if not ok then complete("Error: fetch_url failed: " .. tostring(err)) end
     return
+  elseif tool_type == "memory_search" then
+    local ok, err = pcall(function()
+      require("ai_assistant.engram").search(tool_arg.query, { limit = 8 }, function(block)
+        complete((block and block ~= "") and block or "No matching project memories found in engram.")
+      end)
+    end)
+    if not ok then complete("Error: memory_search failed: " .. tostring(err)) end
+    return
+  elseif tool_type == "memory_save" then
+    local ok, err = pcall(function()
+      require("ai_assistant.engram").observe(
+        { type = tool_arg.type, title = tool_arg.title, content = tool_arg.content },
+        function(okk, id_or_err)
+          complete(okk and ("Saved to project memory (engram): " .. tostring(tool_arg.title))
+            or ("Error: could not save to engram: " .. tostring(id_or_err)))
+        end)
+    end)
+    if not ok then complete("Error: memory_save failed: " .. tostring(err)) end
+    return
   end
 
-  -- Synchronous tools (read/write/memory). Wrap so a raised IO/filesystem error
+  -- Synchronous tools (read/write). Wrap so a raised IO/filesystem error
   -- becomes a graceful "Error: ..." tool result the model is told about.
   local ok, err = pcall(function()
     if tool_type == "read_file" then
@@ -525,9 +492,6 @@ function M.execute_tool(tool_type, tool_arg, on_complete, opts)
       f:write(tool_arg.content)
       f:close()
       complete("File written successfully: " .. tostring(tool_arg.path))
-    elseif tool_type == "save_memory" then
-      local saved = config.append_memory(tool_arg)
-      complete(saved and ("Saved to project memory: " .. tostring(tool_arg)) or "Error: could not save to memory.")
     else
       complete("Error: Unknown tool type.")
     end
@@ -624,22 +588,60 @@ end
 -- File Mention Processor
 ----------------------------------------------------------------------
 
-local function process_file_mentions(prompt, project_root)
-  local mentions = {}
-  for filename in prompt:gmatch("@([%w_%-%.%/]+)") do
-    local filepath = project_root .. "/" .. filename
-    if vim.fn.filereadable(filepath) == 1 then
-      local f = io.open(filepath, "r")
+-- Read a skill's SKILL.md. Project skill (<root>/.claude/skills) wins over the
+-- user skill (~/.claude/skills). Returns the file contents or nil.
+local function read_skill(name, project_root)
+  local candidates = {
+    project_root .. "/.claude/skills/" .. name .. "/SKILL.md",
+    vim.fn.expand("~/.claude/skills/") .. name .. "/SKILL.md",
+  }
+  for _, p in ipairs(candidates) do
+    if vim.fn.filereadable(p) == 1 then
+      local f = io.open(p, "r")
       if f then
         local content = f:read("*all")
         f:close()
-        local ext = filename:match("%.([^%.]+)$") or ""
-        table.insert(mentions, string.format("\n### Context File: %s\n```%s\n%s\n```\n", filename, ext, content))
+        return content
       end
     end
   end
-  if #mentions > 0 then
-    return prompt .. "\n" .. table.concat(mentions, "\n")
+  return nil
+end
+
+local function process_file_mentions(prompt, project_root)
+  local blocks = {}
+  -- Skills first: @skill:<name> injects the SKILL.md as instructions/context.
+  local seen_skill = {}
+  for name in prompt:gmatch("@skill:([%w_%-]+)") do
+    if not seen_skill[name] then
+      seen_skill[name] = true
+      local content = read_skill(name, project_root)
+      if content then
+        blocks[#blocks + 1] = string.format("\n### Skill: %s\n%s\n", name, content)
+      end
+    end
+  end
+  -- Files: @<path>. Strip the @skill:<name> tokens first so the file regex (whose
+  -- char class stops at the ":") doesn't capture a spurious "skill" filename.
+  local file_scan = prompt:gsub("@skill:[%w_%-]+", " ")
+  local seen_file = {}
+  for filename in file_scan:gmatch("@([%w_%-%.%/]+)") do
+    if not seen_file[filename] then
+      seen_file[filename] = true
+      local filepath = project_root .. "/" .. filename
+      if vim.fn.filereadable(filepath) == 1 then
+        local f = io.open(filepath, "r")
+        if f then
+          local content = f:read("*all")
+          f:close()
+          local ext = filename:match("%.([^%.]+)$") or ""
+          blocks[#blocks + 1] = string.format("\n### Context File: %s\n```%s\n%s\n```\n", filename, ext, content)
+        end
+      end
+    end
+  end
+  if #blocks > 0 then
+    return prompt .. "\n" .. table.concat(blocks, "\n")
   end
   return prompt
 end
@@ -689,27 +691,6 @@ local function openai_is_reasoning(model)
   return m:match("^o%d") ~= nil or m:match("^gpt%-5") ~= nil
 end
 
--- Pulls the incremental text out of one parsed streaming chunk, per provider.
--- Every return is jstr_or_nil-coerced so a JSON-null delta (vim.NIL) can never
--- escape as userdata.
-local function extract_stream_delta(provider, obj)
-  if provider == "anthropic" then
-    if obj.type == "content_block_delta" and obj.delta and obj.delta.type == "text_delta" then
-      return jstr_or_nil(obj.delta.text)
-    end
-  elseif provider == "openai" then
-    local ch = obj.choices and obj.choices[1]
-    return jstr_or_nil(ch and ch.delta and ch.delta.content)
-  elseif provider == "gemini" then
-    local cand = obj.candidates and obj.candidates[1]
-    local part = cand and cand.content and cand.content.parts and cand.content.parts[1]
-    return jstr_or_nil(part and part.text)
-  elseif provider == "ollama" then
-    return jstr_or_nil(obj.message and obj.message.content)
-  end
-  return nil
-end
-
 ----------------------------------------------------------------------
 -- Native Tool Calling (tools / tool_use / tool_result)
 ----------------------------------------------------------------------
@@ -737,11 +718,24 @@ local TOOL_DEFS = {
     },
     required = { "path", "content" },
   },
+  -- Project memory (engram). memory_search recalls; memory_save persists. Both
+  -- are localhost reads/writes that auto-run without approval. Stripped from the
+  -- tool list by active_tool_defs when engram is disabled.
   {
-    name = "save_memory",
-    description = "Save one durable fact about this project to long-term memory that persists across sessions (e.g. 'this repo uses Gradle, not Maven', preferred libraries, conventions). Saved silently without approval.",
-    properties = { fact = { type = "string", description = "The single fact to remember" } },
-    required = { "fact" },
+    name = "memory_search",
+    description = "Search this project's long-term memory (engram) for past decisions, architecture notes, fixed bugs, patterns, conventions, configs, or preferences. Use this BEFORE web_search whenever the question may have been answered or decided earlier in THIS project.",
+    properties = { query = { type = "string", description = "What to recall." } },
+    required = { "query" },
+  },
+  {
+    name = "memory_save",
+    description = "Save ONE durable fact about THIS project to long-term memory (engram), persisting across sessions. Use for decisions, architecture, fixed bugs, conventions, configs, or preferences — not transient task details. Saved silently without approval.",
+    properties = {
+      title = { type = "string", description = "A short title for the memory." },
+      content = { type = "string", description = "The full fact/detail to remember." },
+      type = { type = "string", description = "One of: decision, architecture, bugfix, pattern, config, discovery, learning, preference. Default: learning." },
+    },
+    required = { "title", "content" },
   },
   -- Web tools (web_search / fetch_url) are appended only when web search is
   -- enabled in settings; see active_tool_defs below. Executed client-side via
@@ -766,18 +760,22 @@ local TOOL_DEFS = {
   },
 }
 
--- Names of the web tools that active_tool_defs strips when web search is off.
+-- Tool groups that active_tool_defs strips when their backend is off, so the
+-- model is never offered a tool it can't run.
 local WEB_TOOL_NAMES = { web_search = true, fetch_url = true }
+local MEMORY_TOOL_NAMES = { memory_search = true, memory_save = true }
 
--- The canonical tool list for THIS request: TOOL_DEFS, minus the web tools when
--- web search is disabled, so the model is never offered a tool it can't run.
+-- The canonical tool list for THIS request: TOOL_DEFS minus the web tools when
+-- web search is off, minus the memory tools when engram is off.
 local function active_tool_defs(settings)
   local ws = settings and settings.web_search
   local web_on = (ws == nil) or (ws.enabled ~= false and ws.provider ~= "disabled")
-  if web_on then return TOOL_DEFS end
+  local mem_on = (not settings) or settings.engram_enabled ~= false
+  if web_on and mem_on then return TOOL_DEFS end
   local out = {}
   for _, d in ipairs(TOOL_DEFS) do
-    if not WEB_TOOL_NAMES[d.name] then out[#out + 1] = d end
+    local drop = (not web_on and WEB_TOOL_NAMES[d.name]) or (not mem_on and MEMORY_TOOL_NAMES[d.name])
+    if not drop then out[#out + 1] = d end
   end
   return out
 end
@@ -823,8 +821,10 @@ function M.tool_call_to_exec(name, input)
     -- empty file (which would truncate an existing file). The type-check guards
     -- in execute_tool and the tool loop enforce this.
     return "write_file", { path = s(input.path), content = input.content }
-  elseif name == "save_memory" then
-    return "save_memory", s(input.fact)
+  elseif name == "memory_search" then
+    return "memory_search", { query = s(input.query) }
+  elseif name == "memory_save" then
+    return "memory_save", { title = s(input.title), content = s(input.content), type = s(input.type) }
   elseif name == "web_search" then
     -- max_results stays raw (number|string|nil); search.lua clamps/coerces it.
     return "web_search", { query = s(input.query), max_results = input.max_results }
@@ -1334,12 +1334,8 @@ function M.send_prompt_internal(opts, callback)
   -- most-likely-to-change content (project context) LAST.
   local system_parts = {}
 
-  -- 1. Persona (stable within a session/agent)
-  if opts.agent_prompt and opts.agent_prompt ~= "" then
-    table.insert(system_parts, opts.agent_prompt)
-  else
-    table.insert(system_parts, "You are a helpful and expert AI coding assistant.")
-  end
+  -- 1. Persona (stable -> top of the cacheable prefix)
+  table.insert(system_parts, "You are a helpful and expert AI coding assistant.")
 
   -- 2. Tool instructions (fully static -> highest in the cacheable prefix)
   table.insert(system_parts, [[
@@ -1353,8 +1349,23 @@ You have native tool access to the user's machine via tool/function calls:
 Call these tools using your native tool-calling capability — do NOT print the calls as plain text or markup. You may request several tools in a single turn. Briefly tell the user what you intend to do before calling a tool. The user is asked to approve commands and writes (writes show a diff) unless auto-approve is enabled; file paths outside the project root always require manual approval.
 ]])
 
-  -- 2a. Web tools (only documented when web search is enabled, matching the tool
-  -- schema that active_tool_defs sends).
+  -- 2a. Project memory (engram) docs + the memory-first policy, when enabled. The
+  -- relevant memories themselves are injected on the USER turn (volatile), not
+  -- here, so this stays in the cacheable prefix.
+  if settings.engram_enabled ~= false then
+    table.insert(system_parts, [[
+## Project Memory (engram)
+This project has a persistent, cross-session memory. The memories most relevant to
+the user's current message are injected below their message when available.
+- `memory_search` — recall past decisions, architecture, fixed bugs, patterns, conventions, configs, or preferences for THIS project.
+- `memory_save` — save ONE durable fact (type: decision|architecture|bugfix|pattern|config|discovery|learning|preference). Saved silently, no approval.
+
+MEMORY-FIRST POLICY: rely on the injected memories or `memory_search` before answering anything that may have been decided or discovered earlier in this project. Use `web_search` ONLY when project memory has nothing relevant AND the user explicitly asks you to look online, or the question is clearly external (current events, library/API docs, latest versions). Never web-search to recall project-internal facts.
+]])
+  end
+
+  -- 2b. Web tools (only documented when web search is enabled, matching the tool
+  -- schema that active_tool_defs sends). This is the INTERNET FALLBACK.
   do
     local ws = settings.web_search
     if (ws == nil) or (ws.enabled ~= false and ws.provider ~= "disabled") then
@@ -1363,38 +1374,9 @@ You can also access the public web (these run automatically, no approval needed)
 - `web_search` — search the web; returns a numbered list of {title, URL, snippet}
 - `fetch_url` — fetch one web page (or PDF) and read its main content as clean markdown
 
-For anything beyond this codebase — current events, library/API docs, latest versions, unfamiliar errors or tools — use `web_search`, then `fetch_url` on the most relevant result to read it in full, and CITE the source URLs in your answer. Prefer fetched page content over snippets, and note when results look outdated or insufficient.
+Use these per the memory-first policy above: web access is the fallback when project memory has nothing and the user asks for external/online info. After searching, `fetch_url` the most relevant result to read it in full, and CITE the source URLs.
 ]])
     end
-  end
-
-  -- 2b. Plan mode (toggled with /plan): require a plan before any mutation.
-  if opts.plan_mode then
-    table.insert(system_parts, [[
-
-## Plan Mode is ON
-Before using `run_command` or `write_file`, FIRST present a concise numbered plan describing what you will do and why, then stop and let the user approve. Only call those tools after the user has approved the plan. Using `read_file` and answering questions is allowed without a plan.
-]])
-  end
-
-  -- 3. User preferences (stable across the session)
-  if settings.user_context and #settings.user_context > 0 then
-    table.insert(system_parts, "\n## User Preferences & Profile")
-    for _, item in ipairs(settings.user_context) do
-      table.insert(system_parts, string.format("- **%s**: %s", item.id, item.text))
-    end
-  end
-
-  -- 3b. Project memory: durable facts the assistant saved in earlier sessions.
-  local memory = config.read_memory()
-  if memory and memory ~= "" then
-    table.insert(system_parts, "\n## Project Memory (durable facts you saved earlier)\n" .. memory)
-  end
-
-  -- 4. Project context LAST (most volatile; mtime-invalidated upstream)
-  local proj_context = config.get_project_context()
-  if proj_context and proj_context ~= "" then
-    table.insert(system_parts, "\n## Project Context Information\n" .. proj_context)
   end
 
   local system_prompt = table.concat(system_parts, "\n")
@@ -1413,21 +1395,12 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
     processed_prompt = string.format("### Context: Active File (%s)\n```%s\n%s\n```\n\n%s", opts.active_file, ext, opts.active_file_content, processed_prompt)
   end
 
-  -- Optional semantic retrieval (RAG): append the most relevant project code
-  -- chunks for this query to the USER turn (keeps the system prefix cacheable).
-  -- Opt-in and best-effort: silently skipped if Ollama/index is unavailable.
-  if settings.rag_enabled and opts.fresh_user_turn then
-    local ok_rag, rag = pcall(require, "ai_assistant.rag")
-    if ok_rag and rag.has_index() then
-      local hits = rag.retrieve(opts.prompt, 6)
-      if hits and #hits > 0 then
-        local parts = { processed_prompt, "\n### Relevant Project Code (semantic retrieval):" }
-        for _, h in ipairs(hits) do
-          parts[#parts + 1] = string.format("\n-- %s (line %d) --\n```\n%s\n```", h.path, h.line, h.text)
-        end
-        processed_prompt = table.concat(parts, "\n")
-      end
-    end
+  -- Project memory (engram): the pre-search results for this message, injected on
+  -- the USER turn (keeps the system prefix cacheable). The search runs in the chat
+  -- send flow BEFORE this call and arrives via opts.memory_context. Only on a fresh
+  -- user turn (tool continuations already carry it in the recorded user turn).
+  if opts.fresh_user_turn and type(opts.memory_context) == "string" and opts.memory_context ~= "" then
+    processed_prompt = processed_prompt .. "\n\n" .. opts.memory_context
   end
 
   -- Apply context budget truncation
@@ -1536,9 +1509,6 @@ Before using `run_command` or `write_file`, FIRST present a concise numbered pla
       options = { temperature = final_temp },
     }
   end
-
-  -- Compare/council fan-outs ask for plain answers, no tool execution.
-  if opts.no_tools then payload.tools = nil end
 
   local curl = require("plenary.curl")
 
@@ -1769,19 +1739,7 @@ end
 
 function M.send_prompt(opts, callback)
   local settings = config.load_settings()
-  local active_agent = opts.agent or "default"
-  local agent_prompt = ""
-  local agent_model = opts.model
-
-  if active_agent ~= "default" and settings.agents[active_agent] then
-    agent_prompt = settings.agents[active_agent].system_prompt or ""
-    if not agent_model then
-      agent_model = settings.agents[active_agent].model
-    end
-  end
-
-  opts.agent_prompt = agent_prompt
-  opts.model = agent_model or settings.default_model
+  opts.model = opts.model or settings.default_model
 
   -- Ensure we operate on a deepcopy of history to prevent reference mutation
   if not opts._history_cloned then
@@ -1809,7 +1767,7 @@ function M.send_prompt(opts, callback)
     -- each may require async approval and async execution.
     if tool_calls and #tool_calls > 0 then
       if opts.notify_fn and not opts.on_delta and response_text and response_text ~= "" then
-        opts.notify_fn(string.format("\n### AI Assistant (@%s)\n%s\n", active_agent, response_text))
+        opts.notify_fn(string.format("\n### AI Assistant\n%s\n", response_text))
       end
 
       local results = {}
@@ -1831,8 +1789,7 @@ function M.send_prompt(opts, callback)
           -- Tools done; the model now digests their output. Surface that gap so the
           -- header isn't frozen between tool execution and the next streamed token.
           emit_status(opts, "tools")
-          -- Bound the native tool round-trip the way handle_orchestration bounds
-          -- delegation depth. Without this, a model that keeps emitting tool calls
+          -- Bound the native tool round-trip. Without this, a model that keeps emitting tool calls
           -- (e.g. retrying a write it can't complete) recurses send_prompt forever,
           -- so the turn never resolves and the spinner never clears ("can't finish").
           -- The model + tool turns above are already recorded, so the executed
@@ -1871,11 +1828,12 @@ function M.send_prompt(opts, callback)
           return process(i + 1)
         end
 
-        -- Memory writes go to our own data dir and always auto-run (no approval).
-        if tool_type == "save_memory" then
-          emit_status(opts, "remember", status_label(tool_arg, 40))
+        -- Engram memory tools are localhost reads/writes — they never touch the
+        -- filesystem or run a shell command, so they always auto-run (no approval).
+        if tool_type == "memory_save" then
+          emit_status(opts, "remember", status_label(tool_arg.title, 40))
           if opts.notify_fn then
-            opts.notify_fn(string.format("\n> **System**: Remembering: %s\n", tostring(tool_arg)))
+            opts.notify_fn(string.format("\n> **System**: Remembering: %s\n", tostring(tool_arg.title)))
           end
           M.execute_tool(tool_type, tool_arg, function(output)
             table.insert(results, { id = tc.id, name = tc.name, output = output })
@@ -1883,11 +1841,22 @@ function M.send_prompt(opts, callback)
           end, opts)
           return
         end
+        if tool_type == "memory_search" then
+          emit_status(opts, "searching", status_label(tool_arg.query))
+          M.execute_tool(tool_type, tool_arg, function(output)
+            if opts.notify_fn then
+              opts.notify_fn(fold_card(string.format("> 🧠 recalled `%s`", status_label(tool_arg.query, 60)), output))
+            end
+            table.insert(results, { id = tc.id, name = tc.name, output = output })
+            process(i + 1)
+          end, opts)
+          return
+        end
 
         -- Web tools are read-only network reads — they never touch the filesystem
-        -- or run a shell command, so they always auto-run (no approval), like
-        -- save_memory but async. The full result reaches the model via `results`;
-        -- the chat gets a compact collapsible card.
+        -- or run a shell command, so they always auto-run (no approval), like the
+        -- memory tools. The full result reaches the model via `results`; the chat
+        -- gets a compact collapsible card.
         if tool_type == "web_search" or tool_type == "fetch_url" then
           if tool_type == "web_search" then
             emit_status(opts, "searching", status_label(tool_arg.query))
@@ -1985,10 +1954,6 @@ function M.send_prompt(opts, callback)
         else
           needs_confirm = not (settings.auto_approve_tools and in_root)
         end
-        -- Plan mode forces confirmation for mutating tools regardless of auto-approve.
-        if opts.plan_mode and (tool_type == "command" or tool_type == "write_file") then
-          needs_confirm = true
-        end
 
         if not needs_confirm then
           if opts.notify_fn then
@@ -2036,201 +2001,14 @@ function M.send_prompt(opts, callback)
       return
     end
 
-    -- No tool calls.
-    if active_agent == "orchestrator" then
-      M.handle_orchestration(response_text, opts, callback, 1)
-    else
-      if not opts.is_tool_continuation then
-        table.insert(opts.history, { role = "user", content = opts.prompt })
-      end
-      -- Carry Gemini's pure-thinking-turn signature (nil for other providers) so
-      -- build_gemini_contents can echo it back on the next turn.
-      table.insert(opts.history, { role = "model", content = response_text, thought_signature = gemini_sig })
-      callback(true, response_text, opts.history)
+    -- No tool calls: record the plain model turn.
+    if not opts.is_tool_continuation then
+      table.insert(opts.history, { role = "user", content = opts.prompt })
     end
-  end)
-end
-
-----------------------------------------------------------------------
--- Orchestrator Handler
-----------------------------------------------------------------------
-
-function M.handle_orchestration(initial_response, original_opts, callback, depth)
-  local settings = config.load_settings()
-  depth = depth or 1
-
-  if depth > 5 then
-    if original_opts.notify_fn then
-      original_opts.notify_fn("\n\n> **System**: Orchestration depth limit reached. Halting recursion.")
-    end
-    -- On a tool-loop continuation finish_tools() already recorded the real user
-    -- turn (and original_opts.prompt is "" here), so don't insert it again.
-    if not original_opts.is_tool_continuation then
-      table.insert(original_opts.history, { role = "user", content = original_opts.prompt })
-    end
-    table.insert(original_opts.history, { role = "model", content = initial_response })
-    callback(true, initial_response, original_opts.history)
-    return
-  end
-
-  local agent_name, sub_prompt = initial_response:match("%[CALL_AGENT:%s*([%w_%-]+)%]%s*(.*)")
-  if not agent_name or not sub_prompt or sub_prompt == "" then
-    -- On a tool-loop continuation finish_tools() already recorded the real user
-    -- turn (and original_opts.prompt is "" here), so don't insert it again.
-    if not original_opts.is_tool_continuation then
-      table.insert(original_opts.history, { role = "user", content = original_opts.prompt })
-    end
-    table.insert(original_opts.history, { role = "model", content = initial_response })
-    callback(true, initial_response, original_opts.history)
-    return
-  end
-
-  agent_name = agent_name:lower()
-  if not settings.agents[agent_name] and agent_name ~= "default" then
-    if original_opts.notify_fn then
-      original_opts.notify_fn(string.format("\n\n> **System**: Agent `@%s` requested by orchestrator does not exist.", agent_name))
-    end
-    -- On a tool-loop continuation finish_tools() already recorded the real user
-    -- turn (and original_opts.prompt is "" here), so don't insert it again.
-    if not original_opts.is_tool_continuation then
-      table.insert(original_opts.history, { role = "user", content = original_opts.prompt })
-    end
-    table.insert(original_opts.history, { role = "model", content = initial_response })
-    callback(true, initial_response, original_opts.history)
-    return
-  end
-
-  emit_status(original_opts, "delegating", "@" .. agent_name)
-  if original_opts.notify_fn then
-    if not original_opts.on_delta then
-      original_opts.notify_fn(string.format("\n### AI Assistant (@orchestrator)\n%s\n", initial_response))
-    end
-    original_opts.notify_fn(string.format("\n\n> **Orchestrator**: Delegating task to **@%s**...\n> *Prompt: %s*\n", agent_name, sub_prompt))
-  end
-
-  local sub_agent_prompt = settings.agents[agent_name] and settings.agents[agent_name].system_prompt or ""
-  -- Sub-agents use their own pinned model, else the cheap sub-agent default,
-  -- so the expensive coordinator model isn't spent on exploratory delegation.
-  local sub_agent_model = (settings.agents[agent_name] and settings.agents[agent_name].model)
-    or settings.default_subagent_model or settings.default_model
-
-  local sub_opts = {
-    prompt = sub_prompt,
-    history = {}, -- Sub-agents run with fresh context
-    agent = agent_name,
-    agent_prompt = sub_agent_prompt,
-    model = sub_agent_model,
-    selected_text = original_opts.selected_text,
-    notify_fn = original_opts.notify_fn,
-    request_tool_fn = original_opts.request_tool_fn,
-    on_job_started = original_opts.on_job_started,
-    on_status = original_opts.on_status,
-  }
-
-  M.send_prompt(sub_opts, function(sub_success, sub_response, _)
-    if not sub_success then
-      if original_opts.notify_fn then
-        original_opts.notify_fn("\n\n> **System**: Sub-agent delegation failed: " .. sub_response)
-      end
-      callback(false, "Orchestration failed at @" .. agent_name .. " step.", original_opts.history)
-      return
-    end
-
-    if original_opts.notify_fn then
-      original_opts.notify_fn(string.format("\n### Response from @%s:\n%s\n", agent_name, sub_response))
-    end
-
-    local next_prompt = string.format("Agent @%s has responded to the task '%s' with:\n%s\n\nAnalyze this output and provide the next step or final integrated answer.", agent_name, sub_prompt, sub_response)
-    
-    -- On a tool-loop continuation finish_tools() already recorded the real user
-    -- turn (and original_opts.prompt is "" here), so don't insert it again.
-    if not original_opts.is_tool_continuation then
-      table.insert(original_opts.history, { role = "user", content = original_opts.prompt })
-    end
-    table.insert(original_opts.history, { role = "model", content = initial_response })
-
-    local orch_next_opts = {
-      prompt = next_prompt,
-      history = original_opts.history,
-      agent = "orchestrator",
-      agent_prompt = settings.agents.orchestrator.system_prompt,
-      model = settings.agents.orchestrator.model or settings.default_model,
-      selected_text = original_opts.selected_text,
-      notify_fn = original_opts.notify_fn,
-      request_tool_fn = original_opts.request_tool_fn,
-      on_job_started = original_opts.on_job_started,
-      on_delta = original_opts.on_delta,
-      on_response_start = original_opts.on_response_start,
-      on_status = original_opts.on_status,
-    }
-
-    M.send_prompt_internal(orch_next_opts, function(orch_success, orch_next_response)
-      if not orch_success then
-        callback(false, "Orchestrator failed: " .. orch_next_response, orch_next_opts.history)
-        return
-      end
-
-      M.handle_orchestration(orch_next_response, orch_next_opts, callback, depth + 1)
-    end)
-  end)
-end
-
-----------------------------------------------------------------------
--- Council / Compare (multi-model fan-out)
-----------------------------------------------------------------------
-
--- Fan one prompt out to several models in parallel (plain answers, no tools).
--- on_each(model, success, text) fires as each returns; on_done(results) fires
--- once all have completed. results[i] = { model, success, text }.
-function M.run_compare(opts, models, on_each, on_done)
-  local pending = #models
-  if pending == 0 then
-    if on_done then on_done({}) end
-    return
-  end
-  local results = {}
-  for idx, model in ipairs(models) do
-    local sub = {
-      prompt = opts.prompt,
-      history = {},
-      agent = "default",
-      agent_prompt = "",
-      model = model,
-      fresh_user_turn = true,
-      no_tools = true,
-      selected_text = opts.selected_text,
-    }
-    M.send_prompt_internal(sub, function(success, text)
-      results[idx] = { model = model, success = success, text = text }
-      if on_each then on_each(model, success, text) end
-      pending = pending - 1
-      if pending == 0 and on_done then on_done(results) end
-    end)
-  end
-end
-
--- Council = compare + a judge model that synthesizes the single best answer.
-function M.run_council(opts, models, judge_model, on_each, on_done)
-  M.run_compare(opts, models, on_each, function(results)
-    local parts = {
-      "You are an expert judge. The user asked:\n\n" .. (opts.prompt or "") ..
-      "\n\nBelow are candidate answers from different models. Produce the single best answer: correct any errors, and combine the strongest parts. Answer directly — do not mention the candidates, the models, or that you are judging.\n",
-    }
-    for _, r in ipairs(results) do
-      parts[#parts + 1] = string.format("\n--- Candidate (%s) ---\n%s", r.model, (r.text and r.text ~= "") and r.text or "(no answer)")
-    end
-    local judge_opts = {
-      prompt = table.concat(parts, "\n"),
-      history = {},
-      agent = "default",
-      agent_prompt = "",
-      model = judge_model,
-      fresh_user_turn = true,
-      no_tools = true,
-    }
-    M.send_prompt_internal(judge_opts, function(success, text)
-      if on_done then on_done(text, results) end
-    end)
+    -- Carry Gemini's pure-thinking-turn signature (nil for other providers) so
+    -- build_gemini_contents can echo it back on the next turn.
+    table.insert(opts.history, { role = "model", content = response_text, thought_signature = gemini_sig })
+    callback(true, response_text, opts.history)
   end)
 end
 

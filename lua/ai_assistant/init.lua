@@ -1,40 +1,26 @@
 local M = {}
 
 function M.setup(opts)
-  -- Register User Commands
+  -- <leader>cc : open the most-recent chat (or toggle it closed); pastes a visual
+  -- selection into the chat's pending context when invoked from visual mode.
   vim.api.nvim_create_user_command("AIChatToggle", function()
-    local config = require("ai_assistant.config")
-    local ui = require("ai_assistant.ui")
-    
-    -- Extract visual selection if visual mode was active
-    local selected = config.get_visual_selection()
-    
-    -- Launch or hide the Chat Layout
-    ui.toggle_chat(selected)
+    local chat = require("ai_assistant.chat")
+    local selected = nil
+    if vim.fn.mode():match("[vV\22]") then
+      selected = require("ai_assistant.config").get_visual_selection()
+    end
+    chat.open_recent(selected)
   end, { range = true })
 
+  -- <leader>cx : settings menu (API keys, default model, previous chats, the two
+  -- toggles, command denylist).
   vim.api.nvim_create_user_command("AIContextManage", function()
-    local ui = require("ai_assistant.ui")
-    ui.manage_context()
+    require("ai_assistant.ui").manage_context()
   end, {})
 
-  vim.api.nvim_create_user_command("AICreateProjectContext", function()
-    local config = require("ai_assistant.config")
-    config.init_project_context()
-  end, {})
-
-  -- Build the local semantic (RAG) index for the current project.
-  vim.api.nvim_create_user_command("AIIndexProject", function()
-    require("ai_assistant.rag").build_index()
-  end, {})
-
-  -- Toggle semantic retrieval on/off.
-  vim.api.nvim_create_user_command("AIRagToggle", function()
-    local config = require("ai_assistant.config")
-    local settings = config.load_settings()
-    settings.rag_enabled = not settings.rag_enabled
-    config.save_settings(settings)
-    vim.notify("AI Assistant: semantic retrieval (RAG) " .. (settings.rag_enabled and "ENABLED" or "DISABLED"), vim.log.levels.INFO)
+  -- <leader>ci : interrupt the running agent (works whether or not the window is open).
+  vim.api.nvim_create_user_command("AIInterrupt", function()
+    require("ai_assistant.chat").interrupt_active()
   end, {})
 end
 

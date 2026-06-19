@@ -10,9 +10,9 @@ return {
       require("ai_assistant").setup()
     end,
     keys = {
-      { "<leader>cc", "<cmd>AIChatToggle<CR>", mode = { "n", "v" }, desc = "Toggle AI Chat" },
-      { "<leader>cx", "<cmd>AIContextManage<CR>", mode = { "n" }, desc = "Manage AI Context" },
-      { "<leader>cp", "<cmd>AICreateProjectContext<CR>", mode = { "n" }, desc = "Create Project Context" },
+      { "<leader>cc", "<cmd>AIChatToggle<CR>", mode = { "n", "v" }, desc = "AI Chat (most recent / toggle)" },
+      { "<leader>cx", "<cmd>AIContextManage<CR>", mode = { "n" }, desc = "AI Settings" },
+      { "<leader>ci", "<cmd>AIInterrupt<CR>", mode = { "n" }, desc = "AI Interrupt agent" },
     },
-  }
+  },
 }

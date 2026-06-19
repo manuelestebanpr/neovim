@@ -2,12 +2,10 @@ local M = {}
 
 local SETTINGS_PATH = vim.fn.stdpath("data") .. "/ai_assistant_settings.json"
 local CHATS_DIR = vim.fn.stdpath("data") .. "/ai_assistant_chats"
-local MEMORY_DIR = vim.fn.stdpath("data") .. "/ai_assistant_memory"
 
 -- Markers used to detect the project root, relative to the active buffer.
 local ROOT_MARKERS = {
   ".git",
-  ".ai_context",
   "CLAUDE.md",
   ".cursorrules",
   "package.json",
@@ -19,68 +17,46 @@ local ROOT_MARKERS = {
   ".luarc.json",
 }
 
--- Single source of truth for model lists, shared by api.lua (defaults/fallbacks)
--- and ui.lua (picker). When an API key is set the live /v1/models discovery is
--- authoritative; these lists are the no-key fallback and the canonical ordering.
--- Anthropic IDs are current as of 2026-06 (the old claude-3-* are all retired).
--- Gemini/OpenAI lead with the newest tiers; discovery fills in whatever is live.
--- Moonshot (Kimi) speaks the OpenAI-compatible API at api.moonshot.ai; the kimi-k2.x
--- ids are reasoning models (always-on thinking, temperature pinned to 1).
+-- Single source of truth for the picker's no-key fallback lists + canonical
+-- ordering. When an API key is set, live /v1/models discovery is authoritative;
+-- these are the fallback. Kimi (moonshot) + Claude (anthropic) lead per the
+-- model-ordering requirement; Gemini follows. Local models (ollama/llama.cpp)
+-- are discovery-only and surface FIRST when their server is reachable.
 M.MODELS = {
-  gemini = { "gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite" },
-  anthropic = { "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5" },
-  openai = { "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano" },
   moonshot = { "kimi-k2.6", "kimi-k2.5" },
+  anthropic = { "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5" },
+  gemini = { "gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite" },
 }
 
--- Root-level context files auto-loaded into the system prompt when present.
--- AGENTS.md is the emerging cross-tool standard and is listed first.
-M.WELL_KNOWN_CONTEXT_FILES = {
-  "AGENTS.md",
-  "CLAUDE.md",
-  ".cursorrules",
-  ".github/copilot-instructions.md",
-  ".windsurfrules",
-  "ai.md",
-}
-
--- Project-context size limits (bytes). Project context is injected into the
--- system prompt on EVERY turn, so an oversized rule file or a big JSON dropped
--- into .ai_context/ would otherwise silently blow the model's context window.
-local PER_FILE_CONTEXT_CAP = 64 * 1024
-local TOTAL_CONTEXT_CAP = 256 * 1024
-
--- Keys whose nested tables should be deep-merged with defaults.
--- Everything else (notably arrays like `user_context` and `command_denylist`) is
--- treated atomically: if the user saved it, we use their version verbatim.
+-- Keys whose nested tables are deep-merged with defaults on load (so newly added
+-- sub-keys appear for users with an older saved block). Everything else (arrays
+-- like command_denylist) is taken from the user's saved settings verbatim.
 local DEEP_MERGE_KEYS = {
   api_keys = true,
-  agents = true,
-  -- Deep-merged so new sub-keys (a freshly added backend, a new tunable) appear
-  -- for users who already have a saved web_search block from an earlier version.
   web_search = true,
 }
 
 local default_settings = {
-  default_model = "gemini-2.5-flash",
-  -- Fast/cheap model used for delegated sub-agents that don't pin their own
-  -- model (keeps the expensive coordinator model off exploratory sub-tasks).
-  default_subagent_model = "gemini-2.5-flash",
-  -- Base URL of a local llama.cpp server (`llama-server`), which exposes an
-  -- OpenAI-compatible API. Models served here are discovered from
-  -- `<url>/v1/models` and tagged with a "llamacpp:" prefix in the picker. Change
-  -- the port here if you launched llama-server on a different one.
+  -- Persisted default model for new Neovim sessions (kimi/claude lead).
+  default_model = "kimi-k2.6",
+  -- Base URL of a local llama.cpp server (`llama-server`, OpenAI-compatible).
+  -- Models served here are discovered from `<url>/v1/models` and tagged with a
+  -- "llamacpp:" prefix in the picker.
   llama_server_url = "http://127.0.0.1:8080",
-  -- When true (and a vector index exists), inject the most relevant retrieved
-  -- code chunks for each query instead of relying only on whole-file context.
-  rag_enabled = false,
+  -- Engram (persistent project memory) — local HTTP API. The plugin searches
+  -- engram before each message and exposes memory_search/memory_save tools.
+  engram_enabled = true,
+  engram_url = "http://127.0.0.1:7437",
+  -- Optional bearer token if engram was started with ENGRAM_HTTP_TOKEN.
+  engram_token = "",
+  -- ON by default => run_command / read_file / web tools ask for approval first.
+  -- (Denylisted commands and out-of-root writes ALWAYS ask, regardless.)
   auto_approve_tools = false,
-  -- When false (default), file writes are shown as a reviewable diff you accept
-  -- or reject before they are applied. Toggle per-session with `/diff`. When
-  -- true, in-root writes apply automatically and surface a collapsed diff card.
-  auto_write_files = false,
-  -- Estimated token budget for the conversation. When exceeded, the UI trims
-  -- the oldest turns before sending. Rough estimate (~4 chars/token).
+  -- ON by default => file writes apply immediately and surface a collapsed diff
+  -- card. Toggle off to review each write as an accept/reject diff first.
+  auto_write_files = true,
+  -- Estimated token budget for the conversation. When exceeded, the oldest turns
+  -- are trimmed before sending. Rough estimate (~4 chars/token).
   context_token_budget = 100000,
   -- Commands matching any of these Lua patterns ALWAYS require manual
   -- confirmation, even when auto_approve_tools is enabled.
@@ -108,62 +84,24 @@ local default_settings = {
   },
   api_keys = {
     gemini = "",
-    openai = "",
     anthropic = "",
-    ollama = "",
     moonshot = "",
+    ollama = "",
     -- Only needed if llama-server was started with `--api-key`; left blank,
     -- requests go out unauthenticated (the common local setup).
     llamacpp = "",
   },
-  -- Web access for the agent. Exposes the `web_search` + `fetch_url` native tools
-  -- to EVERY provider (the local llama.cpp model included). The default backend
-  -- needs no API key: a self-hosted SearXNG (run it on `searxng_url` with JSON
-  -- output enabled), falling back to keyless DuckDuckGo. Add a Tavily/Serper/Brave
-  -- key below for more reliable results. Keys also read from the env vars
-  -- TAVILY_API_KEY / SERPER_API_KEY / BRAVE_API_KEY / JINA_API_KEY (env wins).
+  -- Web access for the agent — the INTERNET FALLBACK, used only when project
+  -- memory has nothing and the user explicitly asks to look online. Exposes the
+  -- `web_search` + `fetch_url` native tools. Keyless by default (self-hosted
+  -- SearXNG -> DuckDuckGo). Keys also read from TAVILY/SERPER/BRAVE/JINA_API_KEY.
   web_search = {
     enabled = true,
-    -- "auto" | "searxng" | "tavily" | "serper" | "brave" | "duckduckgo" | "disabled".
-    -- "auto" tries any key-based backend whose key is set, then SearXNG, then
-    -- DuckDuckGo as a keyless last resort.
     provider = "auto",
     searxng_url = "http://127.0.0.1:8080",
     max_results = 5,
-    -- Hard cap on the characters fetch_url returns for a single page (keeps a big
-    -- page from blowing a small local model's context).
     fetch_char_cap = 10000,
     api_keys = { tavily = "", serper = "", brave = "", jina = "" },
-  },
-  user_context = {
-    { id = "developer_profile", text = "I am a full stack software engineer." },
-    { id = "coding_guidelines", text = "Write clean, robust, well-structured code." },
-  },
-  -- Named bundles of { model, agent } the user can switch to instantly.
-  presets = {},
-  -- Models fanned out by /compare and /council. Empty = derive a sensible pair.
-  compare_models = {},
-  agents = {
-    refactor = {
-      system_prompt = "You are an expert refactoring assistant. Simplify logic, remove redundancy, and optimize code without breaking behavior.",
-      model = "gemini-2.5-flash",
-    },
-    reviewer = {
-      system_prompt = "You are an expert code reviewer. Analyze the code for bugs, performance bottlenecks, and edge cases.",
-      model = "gemini-2.5-pro",
-    },
-    orchestrator = {
-      system_prompt = "You are the head agent. You coordinate task execution by delegating sub-tasks to other agents. You can delegate by writing '[CALL_AGENT: agent_name] prompt'. Supported agents are: coder, refactor, reviewer.",
-      model = "gemini-2.5-pro",
-    },
-    coder = {
-      system_prompt = "You are an expert programmer. Write clean, complete, and correct code implementation matching specifications.",
-      model = "gemini-2.5-flash",
-    },
-    sdd = {
-      system_prompt = "You are a Spec-Driven Development (SDD) agent. You follow a rigorous software engineering lifecycle: 1. Explore (understand requirements, clarify ambiguities), 2. Spec (document detailed requirements and specs), 3. Design (architecture, data structures, APIs), 4. Implement (write code matching specs), 5. Verify (review, test, validate). Guide the user step-by-step through this lifecycle, requesting approval before advancing to the next phase.",
-      model = "gemini-2.5-pro",
-    },
   },
 }
 
@@ -174,10 +112,9 @@ default_settings.command_denylist[7] = ":" .. "%s*%(" .. "%s*%)%s*" .. "{"
 -- Maps a provider name to the environment variable that may hold its key.
 local ENV_KEYS = {
   gemini = "GEMINI_API_KEY",
-  openai = "OPENAI_API_KEY",
   anthropic = "ANTHROPIC_API_KEY",
-  ollama = "OLLAMA_API_KEY",
   moonshot = "MOONSHOT_API_KEY",
+  ollama = "OLLAMA_API_KEY",
   llamacpp = "LLAMACPP_API_KEY",
 }
 
@@ -199,23 +136,6 @@ local function write_file(path, content)
   file:write(content)
   file:close()
   return true
-end
-
--- A cheap change-signature for a file (path:mtime:size); nil if missing.
-local function stat_signature(path)
-  local uv = vim.uv or vim.loop
-  local ok, st = pcall(uv.fs_stat, path)
-  if not ok or not st then return nil end
-  return string.format("%s:%d:%d", path, st.mtime and st.mtime.sec or 0, st.size or 0)
-end
-
--- Truncate content to a byte cap, appending a clear marker when cut.
-local function truncate_content(content, cap, label)
-  if #content > cap then
-    return content:sub(1, cap)
-      .. string.format("\n...[truncated %d bytes of %s]...\n", #content - cap, label or "file")
-  end
-  return content
 end
 
 ----------------------------------------------------------------------
@@ -342,6 +262,26 @@ function M.get_llama_server_url(settings)
   return (url:gsub("/+$", ""))
 end
 
+-- Normalized base URL of the local engram memory server (trailing slashes
+-- trimmed so callers can append "/search", "/observations", etc.).
+function M.get_engram_url(settings)
+  local url = settings and settings.engram_url
+  if type(url) ~= "string" or url == "" then
+    url = "http://127.0.0.1:7437"
+  end
+  return (url:gsub("/+$", ""))
+end
+
+-- Optional bearer token for engram (env ENGRAM_HTTP_TOKEN wins). String-guarded
+-- (a JSON-null in settings decodes to vim.NIL, which must never reach a concat).
+function M.get_engram_token(settings)
+  local env_val = vim.env["ENGRAM_HTTP_TOKEN"]
+  if env_val and env_val ~= "" then return env_val end
+  local t = settings and settings.engram_token
+  if type(t) == "string" then return t end
+  return ""
+end
+
 function M.get_default_settings()
   return vim.deepcopy(default_settings)
 end
@@ -351,11 +291,10 @@ function M.get_settings_path()
 end
 
 ----------------------------------------------------------------------
--- Project root + context (with caching)
+-- Project root (used as engram's per-project scope key)
 ----------------------------------------------------------------------
 
 local project_root_cache = nil
-local context_cache = { root = nil, text = nil, sig = nil }
 
 function M.refresh_project_root()
   local ok, root
@@ -367,10 +306,7 @@ function M.refresh_project_root()
   if not ok or not root then
     root = vim.fn.getcwd()
   end
-  if root ~= project_root_cache then
-    project_root_cache = root
-    context_cache = { root = nil, text = nil, sig = nil }
-  end
+  project_root_cache = root
   return project_root_cache
 end
 
@@ -385,80 +321,12 @@ function M.get_project_root()
   return project_root_cache
 end
 
-function M.invalidate_context_cache()
-  context_cache = { root = nil, text = nil }
-end
-
--- Returns the ordered list of files that contribute to project context, as
--- { label, path, kind } entries (kind = "file" for .ai_context, "rule" for
--- well-known root files). Shared so the UI header can count the SAME files
--- that actually get loaded.
-function M.list_context_files(root)
-  root = root or M.get_project_root()
-  local files = {}
-  if not root then return files end
-
-  local context_dir = root .. "/.ai_context"
-  if vim.fn.isdirectory(context_dir) == 1 then
-    local names = {}
-    for name, ftype in vim.fs.dir(context_dir) do
-      if ftype == "file" and (name:match("%.md$") or name:match("%.txt$") or name:match("%.json$") or name:match("%.lua$")) then
-        table.insert(names, name)
-      end
-    end
-    table.sort(names) -- deterministic order keeps the cache signature stable
-    for _, name in ipairs(names) do
-      table.insert(files, { label = ".ai_context/" .. name, path = context_dir .. "/" .. name, kind = "file" })
-    end
-  end
-
-  for _, rel in ipairs(M.WELL_KNOWN_CONTEXT_FILES) do
-    local filepath = root .. "/" .. rel
-    if vim.fn.filereadable(filepath) == 1 then
-      table.insert(files, { label = rel, path = filepath, kind = "rule" })
-    end
-  end
-
-  return files
-end
-
-function M.get_project_context(force)
-  local root = M.get_project_root()
-  if not root then return "" end
-
-  local files = M.list_context_files(root)
-
-  -- Change-signature over all contributing files: rebuild when any file's
-  -- mtime/size changes mid-session (edit CLAUDE.md and the model sees it now).
-  local sig_parts = {}
-  for _, f in ipairs(files) do
-    table.insert(sig_parts, stat_signature(f.path) or (f.path .. ":?"))
-  end
-  local sig = table.concat(sig_parts, "|")
-
-  if not force and context_cache.root == root and context_cache.sig == sig and context_cache.text ~= nil then
-    return context_cache.text
-  end
-
-  local context_text = {}
-  local total = 0
-  for _, f in ipairs(files) do
-    if total >= TOTAL_CONTEXT_CAP then
-      table.insert(context_text, "\n...[project context truncated: total size cap reached]...\n")
-      break
-    end
-    local content = read_file(f.path)
-    if content and content ~= "" then
-      content = truncate_content(content, PER_FILE_CONTEXT_CAP, f.label)
-      total = total + #content
-      local header = (f.kind == "file") and "### File: %s\n---\n%s\n---\n" or "### Project Rule File: %s\n---\n%s\n---\n"
-      table.insert(context_text, string.format(header, f.label, content))
-    end
-  end
-
-  local result = table.concat(context_text, "\n")
-  context_cache = { root = root, text = result, sig = sig }
-  return result
+-- Per-project engram scope key: the git-root basename. Engram normalizes
+-- (lowercase/trim) server-side; we pass it explicitly because the server
+-- auto-detects project from ITS cwd, not from the request.
+function M.engram_project()
+  local root = M.get_project_root() or vim.fn.getcwd()
+  return vim.fn.fnamemodify(root, ":t")
 end
 
 ----------------------------------------------------------------------
@@ -483,7 +351,7 @@ function M.get_visual_selection()
   -- Fallback byte-index selection logic
   local _, srow, scol, _ = unpack(vim.fn.getpos(in_visual and "v" or "'<"))
   local _, erow, ecol, _ = unpack(vim.fn.getpos(in_visual and "." or "'>"))
-  
+
   if srow == 0 or erow == 0 then
     return nil
   end
@@ -518,89 +386,9 @@ function M.get_visual_selection()
   return table.concat(lines, "\n")
 end
 
-function M.init_project_context()
-  local root = M.get_project_root()
-  local context_dir = root .. "/.ai_context"
-  if vim.fn.isdirectory(context_dir) == 0 then
-    vim.fn.mkdir(context_dir, "p")
-  end
-
-  local readme_path = context_dir .. "/README.md"
-  local readme_file = io.open(readme_path, "r")
-  if not readme_file then
-    local wf = io.open(readme_path, "w")
-    if wf then
-      wf:write([[# Project Context
-
-This directory contains instructions and context files that help the AI Assistant understand this project.
-Any file ending in `.md`, `.txt`, `.json`, or `.lua` in this folder will be loaded automatically and sent to the model with every request.
-
-## Suggestions
-- Create a `tech_stack.md` file listing the languages, frameworks, and tools used in this project.
-- Create a `coding_rules.md` file with style guidelines, architecture diagrams, and conventions.
-]])
-      wf:close()
-    end
-  else
-    readme_file:close()
-  end
-
-  local gitignore_path = root .. "/.gitignore"
-  local gitignore_content = ""
-  local gf = io.open(gitignore_path, "r")
-  if gf then
-    gitignore_content = gf:read("*all")
-    gf:close()
-  end
-
-  if not gitignore_content:find(".ai_context") then
-    local wf = io.open(gitignore_path, "a")
-    if wf then
-      wf:write("\n# AI Assistant local project context\n.ai_context/\n")
-      wf:close()
-      vim.notify("AI Assistant: Initialized .ai_context and added to .gitignore", vim.log.levels.INFO)
-    end
-  else
-    vim.notify("AI Assistant: .ai_context directory is already initialized", vim.log.levels.INFO)
-  end
-end
-
 ----------------------------------------------------------------------
--- Persistent project memory (durable facts across sessions)
+-- Chat session storage (chat_<timestamp>.json per chat)
 ----------------------------------------------------------------------
-
-local function memory_file_for(root)
-  local key = (root or "global"):gsub("[^%w]", "_")
-  return MEMORY_DIR .. "/" .. key .. ".md"
-end
-
-function M.get_memory_path()
-  return memory_file_for(M.get_project_root())
-end
-
-function M.read_memory()
-  return read_file(M.get_memory_path()) or ""
-end
-
--- Append a single durable fact (one bullet) to this project's memory file.
-function M.append_memory(fact)
-  if not fact or vim.trim(fact) == "" then return false end
-  if vim.fn.isdirectory(MEMORY_DIR) == 0 then
-    vim.fn.mkdir(MEMORY_DIR, "p")
-  end
-  local path = M.get_memory_path()
-  local existing = read_file(path) or ""
-  local entry = "- " .. (vim.trim(fact):gsub("\n", " ")) .. "\n"
-  return write_file(path, existing .. entry)
-end
-
-function M.clear_memory()
-  local path = M.get_memory_path()
-  if vim.fn.filereadable(path) == 1 then
-    return os.remove(path) == true
-  end
-  return true
-end
 
 function M.save_chat_session(session_id, history_data)
   if vim.fn.isdirectory(CHATS_DIR) == 0 then
@@ -622,6 +410,9 @@ function M.delete_chat_session(session_id)
   return false
 end
 
+-- Lists persisted chats, most-recent-first. Empty chats are never written to
+-- disk (the runtime keeps the single empty chat in memory), so the msg_count>0
+-- filter only ever drops a file that failed to decode.
 function M.list_chat_sessions()
   if vim.fn.isdirectory(CHATS_DIR) == 0 then
     return {}
@@ -632,9 +423,8 @@ function M.list_chat_sessions()
     if ftype == "file" and name:match("%.json$") then
       local id = name:gsub("%.json$", "")
       local display_name = id:gsub("^chat_", ""):gsub("_", " ")
-      -- Format time display if it matches standard date pattern
       display_name = display_name:gsub("(%d%d%d%d%-%d%d%-%d%d) (%d%d)(%d%d)(%d%d)", "%1 %2:%3:%4")
-      
+
       local filepath = CHATS_DIR .. "/" .. name
       local content = read_file(filepath)
       local msg_count = 0
@@ -644,7 +434,7 @@ function M.list_chat_sessions()
         if ok and type(data) == "table" then
           msg_count = #data
           for _, msg in ipairs(data) do
-            if msg.role == "user" and msg.content and msg.content ~= "" then
+            if msg.role == "user" and type(msg.content) == "string" and msg.content ~= "" then
               summary = msg.content:gsub("\n", " "):sub(1, 35)
               if #msg.content > 35 then
                 summary = summary .. "..."
@@ -664,7 +454,7 @@ function M.list_chat_sessions()
         table.insert(sessions, {
           id = id,
           display = display_text,
-          filepath = filepath
+          filepath = filepath,
         })
       end
     end
