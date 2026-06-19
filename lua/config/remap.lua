@@ -18,7 +18,9 @@ vim.keymap.set("n", "<leader>w", function()
     vim.notify(msg, vim.log.levels.INFO, { title = "File Saved" })
 end, { desc = "Save File" })
 
-vim.keymap.set("n", "<leader>pv", vim.cmd.Ex, { desc = "File Explorer (netrw)" })
+-- <leader>pv => mini.files (handles the hybris config/ & bin/custom symlinks in
+-- place; see lua/plugins/minifiles.lua). netrw stays on <leader>pn as a fallback.
+vim.keymap.set("n", "<leader>pn", vim.cmd.Ex, { desc = "File Explorer (netrw)" })
 vim.keymap.set("n", "<leader>sn", "<cmd>nohlsearch<CR>", { desc = "Clear Search Highlights" })
 
 

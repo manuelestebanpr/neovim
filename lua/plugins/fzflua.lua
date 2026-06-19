@@ -73,6 +73,13 @@ return {
       -- [UPDATED] Reverted to 'rg' for stability, but optimized for speed.
       -- 1. Removed '--sort path': This is the #1 cause of slowness. We let fzf handle sorting visually.
       -- 2. Added proper spacing at the end of every line to prevent errors.
+      --
+      -- HYBRIS SYMLINKS — DO NOT REMOVE `--follow`: in a SAP Commerce project the
+      -- `config/` and `bin/custom/` folders are `ln -s` symlinks into a separate
+      -- extensions repo. `--follow` (a.k.a. `-L`) makes ripgrep descend into them
+      -- so they fuzzy-find as if they were normal in-tree folders, WITHOUT touching
+      -- the link itself. ripgrep has built-in symlink-cycle detection, so following
+      -- is safe. Strip this flag and config/custom silently vanish from the picker.
       cmd = "rg --files --color=never --hidden --follow --no-messages " ..
             "-g '!.git' " ..
             "-g '!.idea' " ..
@@ -87,7 +94,11 @@ return {
 
     -- 5. CONTENT SEARCH (Live Grep)
     grep = {
-      -- [UPDATED] Live grep with identical exclusions
+      -- [UPDATED] Live grep with identical exclusions.
+      -- HYBRIS SYMLINKS — `-L` (== `--follow`) is load-bearing here for the exact
+      -- same reason as the `files` cmd above: it lets live-grep search INTO the
+      -- symlinked `config/` and `bin/custom/` extension folders without resolving
+      -- or removing the link. Keep it in sync with the `files` cmd's `--follow`.
       rg_opts = "--column --line-number --no-heading --color=always --smart-case --max-columns=4096 " ..
                 "--hidden " ..
                 "-L " ..
