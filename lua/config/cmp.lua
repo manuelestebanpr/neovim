@@ -70,6 +70,10 @@ cmp.setup.cmdline({ '/', '?' }, {
   }
 })
 
+-- Hybris ItemType/attribute completion for items.xml + ImpEx (registered here so
+-- cmp stays lazy-loaded on InsertEnter). See lua/hybris/.
+pcall(function() require('hybris').setup_cmp() end)
+
 cmp.setup.cmdline(':', {
   mapping = cmp.mapping.preset.cmdline({
     ['<Tab>'] = {

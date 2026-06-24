@@ -70,23 +70,38 @@ return {
 
     -- 4. FILE SEARCH (Ctrl-P)
     files = {
-      -- [UPDATED] Reverted to 'rg' for stability, but optimized for speed.
-      -- 1. Removed '--sort path': This is the #1 cause of slowness. We let fzf handle sorting visually.
-      -- 2. Added proper spacing at the end of every line to prevent errors.
+      -- HYBRIS SYMLINKS — DO NOT REMOVE `--follow` (-L): config/ and bin/custom/ are
+      -- symlinks into a separate extensions repo; --follow descends into them so
+      -- they fuzzy-find as normal in-tree folders (ripgrep has symlink-cycle
+      -- detection, so it is safe). Strip it and config/custom vanish from the picker.
       --
-      -- HYBRIS SYMLINKS — DO NOT REMOVE `--follow`: in a SAP Commerce project the
-      -- `config/` and `bin/custom/` folders are `ln -s` symlinks into a separate
-      -- extensions repo. `--follow` (a.k.a. `-L`) makes ripgrep descend into them
-      -- so they fuzzy-find as if they were normal in-tree folders, WITHOUT touching
-      -- the link itself. ripgrep has built-in symlink-cycle detection, so following
-      -- is safe. Strip this flag and config/custom silently vanish from the picker.
+      -- SPEED: the platform tree is huge (~126k files). We additionally exclude only
+      -- COMPILED / VENDORED artifacts (-> ~89k, ~1.8s) WITHOUT hiding a single
+      -- editable source file:
+      --   *.class/*.jar      : compiled bytecode / packaged libs (never edited).
+      --   classes/testclasses: ant build OUTPUT; the originals live in the sibling
+      --                        src/ testsrc/ resources/ web/ dirs, so the editable
+      --                        copy is always still visible.
+      --   eclipsebin         : jdtls/Eclipse compile output (incl. our generated
+      --                        .project/.classpath output dirs).
+      --   node_modules       : vendored JS deps.
+      --   *.sha1/*.prefs     : checksum / IDE metadata noise.
+      -- gensrc is deliberately KEPT: it is generated SOURCE you jump into (model beans).
       cmd = "rg --files --color=never --hidden --follow --no-messages " ..
             "-g '!.git' " ..
             "-g '!.idea' " ..
             "-g '!log' " ..
             "-g '!data' " ..
             "-g '!roles' " ..
-            "-g '!temp' ", -- <== Space added here to prevent command corruption
+            "-g '!temp' " ..
+            "-g '!**/node_modules/**' " ..
+            "-g '!**/classes/**' " ..
+            "-g '!**/testclasses/**' " ..
+            "-g '!**/eclipsebin/**' " ..
+            "-g '!*.class' " ..
+            "-g '!*.jar' " ..
+            "-g '!*.sha1' " ..
+            "-g '!*.prefs' ", -- <== trailing space prevents command corruption
 
       file_icons = true,
       git_icons = true,
@@ -94,11 +109,9 @@ return {
 
     -- 5. CONTENT SEARCH (Live Grep)
     grep = {
-      -- [UPDATED] Live grep with identical exclusions.
-      -- HYBRIS SYMLINKS — `-L` (== `--follow`) is load-bearing here for the exact
-      -- same reason as the `files` cmd above: it lets live-grep search INTO the
-      -- symlinked `config/` and `bin/custom/` extension folders without resolving
-      -- or removing the link. Keep it in sync with the `files` cmd's `--follow`.
+      -- `-L` (== --follow) is load-bearing for the symlinked config/ + bin/custom/.
+      -- Mirror the `files` cmd's compiled/vendored exclusions so grepping the whole
+      -- tree does not drown in *.class bytecode and node_modules copies.
       rg_opts = "--column --line-number --no-heading --color=always --smart-case --max-columns=4096 " ..
                 "--hidden " ..
                 "-L " ..
@@ -107,7 +120,15 @@ return {
                 "-g '!log' " ..
                 "-g '!data' " ..
                 "-g '!roles' " ..
-                "-g '!temp' ", -- <== Space added here
+                "-g '!temp' " ..
+                "-g '!**/node_modules/**' " ..
+                "-g '!**/classes/**' " ..
+                "-g '!**/testclasses/**' " ..
+                "-g '!**/eclipsebin/**' " ..
+                "-g '!*.class' " ..
+                "-g '!*.jar' " ..
+                "-g '!*.sha1' " ..
+                "-g '!*.prefs' ", -- <== trailing space
     },
   },
 }

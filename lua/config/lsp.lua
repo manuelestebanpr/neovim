@@ -100,8 +100,30 @@ vim.lsp.config['lemminx'] = {
     end,
 }
 
+-- =============================================================================
+-- JSP support (~1900 storefront *.jsp files)
+-- nvim already sets filetype=jsp. There is no tree-sitter `jsp` grammar, so drive
+-- the `html` parser for jsp buffers (highlighting/indent), and extend emmet +
+-- html LSPs to attach on jsp for tag/attribute/abbreviation completion.
+-- =============================================================================
+pcall(vim.treesitter.language.register, 'html', 'jsp')
+
+-- emmet-language-server: abbreviation expansion (div.foo>span -> markup) + html
+-- completion. includeLanguages tells it to parse jsp as html for abbreviations;
+-- filetypes makes it actually attach to jsp buffers (it doesn't by default).
+vim.lsp.config['emmet_language_server'] = {
+    filetypes = { 'html', 'css', 'scss', 'sass', 'less', 'jsp',
+        'javascriptreact', 'typescriptreact', 'eruby', 'pug' },
+    init_options = { includeLanguages = { jsp = 'html' } },
+}
+
+-- vscode html language server: tag/attribute completion + hover, extended to jsp.
+vim.lsp.config['html'] = {
+    filetypes = { 'html', 'templ', 'jsp' },
+}
+
 -- Explicitly enable the non-jdtls servers. mason-lspconfig's automatic_enable
 -- also does this, but being explicit makes the intent clear and order-independent
 -- (jdtls is started by nvim-jdtls from the FileType autocmd, not here).
-vim.lsp.enable({ 'lua_ls', 'lemminx' })
+vim.lsp.enable({ 'lua_ls', 'lemminx', 'emmet_language_server', 'html' })
 

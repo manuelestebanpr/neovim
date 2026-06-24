@@ -173,6 +173,44 @@ local function find_ancestor_containing(start_path, markers)
   return nil
 end
 
+-- The canonical Hybris *platform* root is the working tree that actually contains
+-- bin/platform. Custom extensions are SYMLINKED in from a separate "extensions"
+-- repo that has NO bin/platform of its own (only bin/custom + config), so a file
+-- opened through its resolved real path has no bin/platform ancestor and the root
+-- must be recovered from the environment or the cwd instead.
+--   Priority: $HYBRIS_HOME_DIR -> $PLATFORM_HOME -> cwd (or an ancestor of it).
+-- Every candidate is validated by the presence of bin/platform so a stray/empty
+-- env var can never win. Returns an absolute path or nil.
+function M.get_platform_root()
+  local function valid(root)
+    if root and root ~= "" then
+      root = root:gsub("/+$", "")
+      if vim.fn.isdirectory(root .. "/bin/platform") == 1 then return root end
+    end
+    return nil
+  end
+
+  -- $HYBRIS_HOME_DIR is the parent of the platform tree (mirrors hybris_setup):
+  -- <HYBRIS_HOME_DIR>/hybris is the root. Accept the bare value too, just in case.
+  local env_home = nonempty(vim.env.HYBRIS_HOME_DIR)
+  if env_home then
+    local r = valid(env_home .. "/hybris") or valid(env_home)
+    if r then return r end
+  end
+
+  -- $PLATFORM_HOME points at <root>/bin/platform (set by setantenv); strip the
+  -- trailing "/bin/platform" to recover <root>.
+  local ph = nonempty(vim.env.PLATFORM_HOME)
+  if ph then
+    local r = valid(vim.fn.fnamemodify(ph:gsub("/+$", ""), ":h:h"))
+    if r then return r end
+  end
+
+  -- The user opens nvim in the working Hybris tree, so cwd (or an ancestor) is the
+  -- reliable last resort.
+  return find_ancestor_containing(vim.fn.getcwd(), { "bin/platform" })
+end
+
 -- Detect whether we are inside a Hybris project or a normal Maven/Gradle one.
 -- Returns: project_type ("hybris" | "normal"), root_dir (absolute path)
 function M.detect_project(start_override)
@@ -182,18 +220,50 @@ function M.detect_project(start_override)
   local buf_name = start_override or vim.api.nvim_buf_get_name(0)
   local start_path = (buf_name ~= "") and vim.fs.dirname(buf_name) or vim.fn.getcwd()
 
-  -- 1. Hybris: the root is the directory that directly contains bin/platform.
-  --    (bin/custom and config/localextensions.xml resolve to the same root.)
-  local hybris_root = find_ancestor_containing(start_path, {
-    "bin/platform",
-    "config/localextensions.xml",
-    "bin/custom",
-  })
-  if hybris_root then
+  -- 1. Hybris: the AUTHORITATIVE root is the unique directory that directly
+  --    contains bin/platform. Walk up from the file first.
+  local hybris_root = find_ancestor_containing(start_path, { "bin/platform" })
+
+  -- 2. Custom extensions live behind a `bin/custom` SYMLINK into a separate repo
+  --    that has bin/custom + config/localextensions.xml but NO bin/platform. A file
+  --    opened via that resolved real path -- which jdtls "go to definition" yields
+  --    -- has no bin/platform ancestor, so the previous marker list ("bin/custom"
+  --    or "config/localextensions.xml") anchored the root to the extensions repo
+  --    and the bin/platform check in hybris_setup then bailed with
+  --    "Could not resolve a valid Hybris root directory". When we are clearly inside
+  --    a Hybris tree but cannot see bin/platform above us, recover the real platform
+  --    root from env/cwd instead.
+  if not hybris_root then
+    local in_hybris_ctx = find_ancestor_containing(start_path, {
+      "bin/custom",
+      "config/localextensions.xml",
+      "extensioninfo.xml",
+    })
+    if in_hybris_ctx then
+      local recovered = M.get_platform_root()
+      -- get_platform_root() resolves from $HYBRIS_HOME_DIR/$PLATFORM_HOME/cwd, which
+      -- is INDEPENDENT of the opened file. Guard against misclassifying an unrelated
+      -- project that merely happens to ship an extensioninfo.xml (or a dir named
+      -- bin/custom): only treat THIS file as hybris if it actually lives inside the
+      -- recovered platform root OR inside that root's (symlinked) bin/custom target
+      -- -- the latter is where real custom-extension buffers resolve to.
+      if recovered then
+        local rstart = vim.fn.resolve(vim.fn.fnamemodify(start_path, ":p")):gsub("/+$", "")
+        local rroot = vim.fn.resolve(recovered):gsub("/+$", "")
+        local rcustom = vim.fn.resolve(recovered .. "/bin/custom"):gsub("/+$", "")
+        local function under(base) return rstart == base or rstart:sub(1, #base + 1) == base .. "/" end
+        if under(rroot) or under(rcustom) then
+          hybris_root = recovered
+        end
+      end
+    end
+  end
+
+  if hybris_root and vim.fn.isdirectory(hybris_root .. "/bin/platform") == 1 then
     return "hybris", hybris_root
   end
 
-  -- 2. Normal Maven/Gradle/Git project.
+  -- 3. Normal Maven/Gradle/Git project.
   local normal_root = find_ancestor_containing(start_path, {
     "pom.xml",
     "build.gradle",
