@@ -1,27 +1,31 @@
 -- lua/plugins/minifiles.lua
--- mini.files as the primary file explorer (<leader>pv), replacing netrw for the
--- one thing netrw can't do here.
+-- mini.files is THE file explorer. netrw is fully disabled in init.lua
+-- (g:loaded_netrw / g:loaded_netrwPlugin).
+--
+-- `use_as_default_explorer = true` makes mini.files hijack any directory buffer,
+-- so `nvim .`, `nvim <some/dir>` and `:edit <dir>` all open the explorer at that
+-- path instead of netrw. For the *startup* hijack to fire, mini.files must already
+-- be set up when the directory buffer is entered (which happens right after init,
+-- before any keys/event lazy-trigger would load the plugin) -- hence `lazy = false`.
+-- Only the mini.files module is required, so the rest of the mini.nvim suite is not
+-- pulled in and startup cost stays minimal.
 --
 -- In a SAP Commerce hybris project, config/ and bin/custom/ are `ln -s` symlinks
--- into a separate extensions repo. netrw's tree liststyle cannot browse a
--- directory symlink in place: it resolves the link and "redirects" you to the
--- real …/hybris-extensions/… path (or, forced to keep the path, shows nothing).
--- mini.files descends into a directory symlink AT its in-tree path
--- (…/hybris/config, …/hybris/bin/custom) and lists the real contents — verified
--- against this project — so the symlinks behave like normal in-tree folders,
--- consistent with how fzf (--follow) and jdtls (vim.fn.resolve) already treat
--- them. The link on disk is never touched.
+-- into a separate extensions repo. mini.files descends into a directory symlink AT
+-- its in-tree path (…/hybris/config, …/hybris/bin/custom) and lists the real
+-- contents -- verified against this project -- consistent with how fzf (--follow)
+-- and jdtls (vim.fn.resolve) already treat them. The link on disk is never touched.
 --
--- mini.nvim is already installed (it is a render-markdown dependency); this spec
--- merges into that same plugin and only adds the mini.files setup + keymap.
--- netrw stays available via :Ex and <leader>pn.
+-- mini.nvim is also a render-markdown dependency; lazy merges both specs into the
+-- same plugin (this spec owns the config).
 
 return {
   "nvim-mini/mini.nvim",
+  lazy = false,
   config = function()
     require("mini.files").setup({
-      -- Leave plain `:Ex` to netrw; mini.files is opened explicitly via its map.
-      options = { use_as_default_explorer = false },
+      -- Hijack directory buffers so mini.files replaces netrw everywhere.
+      options = { use_as_default_explorer = true },
       windows = { preview = true, width_focus = 30, width_preview = 70 },
     })
   end,

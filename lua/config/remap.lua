@@ -2,7 +2,10 @@ vim.g.mapleader = " "
 
 vim.keymap.set("n", "<leader>w", function()
     local success, err = pcall(function()
-        vim.cmd("silent! write")
+        -- Force write: overwrite even when the file changed on disk underneath us
+        -- (e.g. Hybris/Backoffice regenerates a *-backoffice-config.xml that is open),
+        -- which would otherwise abort with "E13: File has been changed since reading it".
+        vim.cmd("silent! write!")
     end)
 
     if not success then
@@ -16,11 +19,14 @@ vim.keymap.set("n", "<leader>w", function()
 
     local msg = string.format('"%s" %dB written', file_name, size)
     vim.notify(msg, vim.log.levels.INFO, { title = "File Saved" })
-end, { desc = "Save File" })
+end, { desc = "Save File (force write!)" })
 
--- <leader>pv => mini.files (handles the hybris config/ & bin/custom symlinks in
--- place; see lua/plugins/minifiles.lua). netrw stays on <leader>pn as a fallback.
-vim.keymap.set("n", "<leader>pn", vim.cmd.Ex, { desc = "File Explorer (netrw)" })
+-- mini.files is the only file explorer (netrw is disabled in init.lua).
+-- <leader>pv opens it at the current file; <leader>pn opens it rooted at the cwd
+-- (see lua/plugins/minifiles.lua).
+vim.keymap.set("n", "<leader>pn", function()
+    require("mini.files").open(vim.uv.cwd())
+end, { desc = "File Explorer at cwd (mini.files)" })
 vim.keymap.set("n", "<leader>sn", "<cmd>nohlsearch<CR>", { desc = "Clear Search Highlights" })
 
 
