@@ -52,19 +52,74 @@ function M.get_jdtls_paths()
   return paths
 end
 
--- Safely get the java command from environment or PATH
+-- Treat empty strings as "unset". `vim.env.FOO` returns nil when a variable is
+-- unset but "" when it is exported empty (e.g. `export JAVA_21_HOME=`); the bare
+-- `a or b` idiom would wrongly pick the empty string because "" is truthy in Lua.
+local function nonempty(v)
+  if v and v ~= "" then return v end
+  return nil
+end
+
+-- Resolve the JDK home jdtls should run on AND register as its JavaSE runtime.
+-- Priority: JAVA_21_HOME -> JAVA_HOME -> distro fallback. On this machine
+-- JAVA_HOME points at the SDKMAN `current` symlink (~/.sdkman/.../java/current),
+-- so "whatever SDKMAN has set as current" is honoured automatically.
+function M.get_java_home()
+  return nonempty(vim.env.JAVA_21_HOME)
+      or nonempty(vim.env.JAVA_HOME)
+      or "/usr/lib/jvm/java-21-openjdk"
+end
+
+-- Safely get the java executable jdtls is launched with.
 function M.get_java_cmd()
-  local java_home = vim.env.JAVA_21_HOME or vim.env.JAVA_HOME
-  if java_home and java_home ~= "" then
-    local exe = java_home .. "/bin/java"
-    if vim.fn.executable(exe) == 1 then
-      return exe
-    end
+  local java_home = M.get_java_home()
+  local exe = java_home .. "/bin/java"
+  if vim.fn.executable(exe) == 1 then
+    return exe
   end
   if vim.fn.executable("java") == 1 then
     return "java"
   end
   return "java"
+end
+
+-- Build LSP client capabilities advertising nvim-cmp's completion features.
+-- This is what makes jdtls send auto-import edits (resolveSupport.additionalTextEdits)
+-- and parameter snippets (snippetSupport) on completion. Without it, completing a
+-- type like `Date` inserts the name but NOT `import java.util.Date;`.
+-- Falls back to the protocol defaults if cmp-nvim-lsp is not loaded yet.
+function M.make_capabilities()
+  local caps = vim.lsp.protocol.make_client_capabilities()
+  local ok, cmp_lsp = pcall(require, "cmp_nvim_lsp")
+  if ok then
+    caps = cmp_lsp.default_capabilities(caps)
+  end
+  return caps
+end
+
+-- Locate a generated schema file named `basename` (e.g. "items.xsd", "beans.xsd",
+-- "extensioninfo.xsd") anywhere under `root`. Prefers `fd` (fast, parallel,
+-- symlink-aware) and falls back to vim.fs.find. Used to associate Hybris schemas
+-- with their XML so lemminx can complete elements, attributes and enums. The
+-- generated grammar is identical across extensions, so one representative file
+-- per type is enough to drive completion for every matching XML. Returns an
+-- absolute path or nil.
+function M.find_schema(root, basename)
+  if not root or root == "" or not basename or basename == "" then return nil end
+  local pattern = "^" .. basename:gsub("%.", "\\.") .. "$"
+  if vim.fn.executable("fd") == 1 then
+    local res = vim.fn.systemlist({ "fd", "-L", "-t", "f", "-a", "--", pattern, root })
+    if vim.v.shell_error == 0 and #res > 0 then
+      return res[1]
+    end
+  end
+  local hits = vim.fs.find(basename, { path = root, type = "file", limit = 1 })
+  return hits[1]
+end
+
+-- Back-compat thin wrapper kept for any external callers.
+function M.find_items_xsd(root)
+  return M.find_schema(root, "items.xsd")
 end
 
 -- Find Lombok jar inside jdtls root or common locations
@@ -120,8 +175,11 @@ end
 
 -- Detect whether we are inside a Hybris project or a normal Maven/Gradle one.
 -- Returns: project_type ("hybris" | "normal"), root_dir (absolute path)
-function M.detect_project()
-  local buf_name = vim.api.nvim_buf_get_name(0)
+function M.detect_project(start_override)
+  -- start_override (an absolute FILE path) lets callers resolve a project for a
+  -- buffer other than the current one (e.g. lemminx root_dir, which is handed the
+  -- attaching buffer). Falls back to the current buffer / cwd.
+  local buf_name = start_override or vim.api.nvim_buf_get_name(0)
   local start_path = (buf_name ~= "") and vim.fs.dirname(buf_name) or vim.fn.getcwd()
 
   -- 1. Hybris: the root is the directory that directly contains bin/platform.
@@ -150,6 +208,15 @@ function M.detect_project()
   return "normal", vim.fn.getcwd()
 end
 
+-- Nearest ancestor directory that IS a Hybris extension root (i.e. directly
+-- contains extensioninfo.xml), walking up from `start_path`. Returns the
+-- extension directory or nil. Used to scope a per-extension lemminx instance so
+-- it stays small and resolves that extension's own generated items/beans schemas.
+function M.find_extension_root(start_path)
+  if not start_path or start_path == "" then return nil end
+  return find_ancestor_containing(start_path, { "extensioninfo.xml" })
+end
+
 -- Bind standard LSP and JDTLS-specific keymaps buffer-locally
 function M.setup_keymaps(bufnr)
   local opts = { noremap = true, silent = true }
@@ -161,7 +228,7 @@ function M.setup_keymaps(bufnr)
   vim.keymap.set('n', 'K', vim.lsp.buf.hover, { buffer = bufnr, desc = "Hover Documentation" })
   vim.keymap.set('i', '<C-k>', vim.lsp.buf.signature_help, { buffer = bufnr, desc = "Signature Help" })
   
-  -- FZF-Lua integration for references
+  -- FZF-Lua integration for references (every usage of the symbol under cursor)
   vim.keymap.set('n', 'gr', function()
     local ok, fzf = pcall(require, 'fzf-lua')
     if ok then
@@ -172,7 +239,32 @@ function M.setup_keymaps(bufnr)
     else
       vim.lsp.buf.references()
     end
-  end, { buffer = bufnr, desc = "FZF LSP References" })
+  end, { buffer = bufnr, desc = "References (all usages)" })
+
+  -- Call hierarchy & implementations. Prefer fzf-lua's picker, fall back to the
+  -- builtin quickfix-based handlers. Typical flow for "where is this impl used?":
+  --   1. on an interface method, `gi` jumps to the implementation(s),
+  --   2. on the implementation, `<leader>ji` lists everything that CALLS it.
+  local function lsp_pick(fzf_fn, builtin_fn)
+    return function()
+      local ok, fzf = pcall(require, 'fzf-lua')
+      if ok and fzf[fzf_fn] then
+        fzf[fzf_fn]()
+      else
+        builtin_fn()
+      end
+    end
+  end
+
+  vim.keymap.set('n', '<leader>ji',
+    lsp_pick('lsp_incoming_calls', vim.lsp.buf.incoming_calls),
+    { buffer = bufnr, desc = "Incoming Calls (who calls this)" })
+  vim.keymap.set('n', '<leader>jo',
+    lsp_pick('lsp_outgoing_calls', vim.lsp.buf.outgoing_calls),
+    { buffer = bufnr, desc = "Outgoing Calls (what this calls)" })
+  vim.keymap.set('n', '<leader>js',
+    lsp_pick('lsp_implementations', vim.lsp.buf.implementation),
+    { buffer = bufnr, desc = "Implementations (interface -> impl)" })
 
   -- 2. Refactoring & Code Actions
   vim.keymap.set({ 'n', 'v' }, '<leader>ca', vim.lsp.buf.code_action, { buffer = bufnr, desc = "Code Actions" })
@@ -187,14 +279,17 @@ function M.setup_keymaps(bufnr)
     vim.keymap.set('n', '<leader>ec', jdtls.extract_constant, { buffer = bufnr, desc = "Extract Constant" })
     vim.keymap.set('v', '<leader>ec', function() jdtls.extract_constant(true) end, { buffer = bufnr, desc = "Extract Constant" })
     vim.keymap.set('v', '<leader>em', function() jdtls.extract_method(true) end, { buffer = bufnr, desc = "Extract Method" })
+    -- Jump to the super / overridden method (e.g. impl method -> interface decl).
+    vim.keymap.set('n', '<leader>jp', jdtls.super_implementation, { buffer = bufnr, desc = "Go to Super / Parent Implementation" })
   end
 
-  -- 4. which-key buffer-local group name for the JDTLS extract/refactor maps.
-  -- Registered per-buffer so it only shows up inside Java files.
+  -- 4. which-key buffer-local group names for the JDTLS maps. Registered
+  -- per-buffer so they only show up inside Java files.
   local ok_wk, wk = pcall(require, 'which-key')
   if ok_wk then
     wk.add({
       { '<leader>e', group = "Extract / Refactor", mode = { 'n', 'v' }, buffer = bufnr },
+      { '<leader>j', group = "Java / Navigation", buffer = bufnr },
     })
   end
 end

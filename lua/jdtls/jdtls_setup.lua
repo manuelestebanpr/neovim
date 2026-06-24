@@ -53,20 +53,37 @@ function M.setup(detected_root)
   table.insert(cmd, "-data")
   table.insert(cmd, workspace_dir)
 
+  local java_home = utils.get_java_home()
+
   local config = {
     cmd = cmd,
 
     root_dir = root_dir,
 
+    -- Advertise nvim-cmp completion features so completing a type also inserts
+    -- its `import ...;` (additionalTextEdits) and method completions carry
+    -- parameter snippets. extendedClientCapabilities unlocks jdtls extras
+    -- (decompiled class navigation, resolved organize-imports, etc.).
+    capabilities = utils.make_capabilities(),
+
     init_options = {
-      bundles = {}
+      bundles = {},
+      extendedClientCapabilities = require('jdtls').extendedClientCapabilities,
     },
 
     settings = {
       java = {
         signatureHelp = { enabled = true },
         contentProvider = { preferred = "fernflower" },
+        -- Tell jdtls which JDK to compile/index against. Without a registered
+        -- runtime, java.lang/java.util resolution can silently fall back or
+        -- break; this pins it to the SDKMAN `current` JDK (see utils.get_java_home).
+        configuration = {
+          runtimes = { { name = "JavaSE-21", path = java_home, default = true } },
+        },
         completion = {
+          -- Fill method calls with placeholder args (snippet) instead of just `()`.
+          guessMethodArguments = true,
           favoriteStaticMembers = {
             "org.hamcrest.MatcherAssert.assertThat",
             "org.hamcrest.Matchers.*",

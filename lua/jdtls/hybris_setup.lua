@@ -36,7 +36,7 @@ local function init_paths(hybris_root)
   local paths = utils.get_jdtls_paths()
 
   CONF.JAVA_CMD = utils.get_java_cmd()
-  CONF.JAVA_HOME = vim.env.JAVA_21_HOME or vim.env.JAVA_HOME or "/usr/lib/jvm/java-21-openjdk"
+  CONF.JAVA_HOME = utils.get_java_home()
   CONF.WORKSPACE_DATA = os.getenv("HOME") .. "/.local/share/nvim/sapcommerce/" .. hybris_dir_name
   CONF.CONFIG_PATH = paths.config
   CONF.JDTLS_JAR = paths.launcher
@@ -390,8 +390,13 @@ function M.setup(detected_root)
   jdtls.start_or_attach({
     cmd = cmd,
     root_dir = CONF.HYBRIS_ROOT,
+    -- Advertise nvim-cmp completion features (auto-import via additionalTextEdits,
+    -- method-argument snippets). This is the fix for "completion inserts the type
+    -- name but not its import". See utils.make_capabilities.
+    capabilities = utils.make_capabilities(),
     init_options = {
       bundles = {},
+      extendedClientCapabilities = jdtls.extendedClientCapabilities,
       workspaceFolders = STATE.workspace_folders,
     },
     settings = {
@@ -399,6 +404,17 @@ function M.setup(detected_root)
         signatureHelp = { enabled = true },
         contentProvider = { preferred = "fernflower" },
         autobuild = { enabled = false },
+        completion = {
+          -- Fill method calls with placeholder args (snippet) instead of just `()`.
+          guessMethodArguments = true,
+          filteredTypes = {
+            "com.sun.*",
+            "sun.*",
+            "jdk.*",
+            "org.graalvm.*",
+            "oracle.*",
+          },
+        },
         import = {
           gradle = { enabled = false },
           maven = { enabled = false },
