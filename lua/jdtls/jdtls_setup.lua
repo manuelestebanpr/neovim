@@ -1,6 +1,10 @@
 local M = {}
 local utils = require('jdtls.utils')
 
+-- Roots whose dap main-class LAUNCH configs have already been resolved, so the
+-- (LSP-scanning) setup_dap_main_class_configs runs once per project, not per buffer.
+M._dap_main_done = {}
+
 function M.setup(detected_root)
   -- =============================================================================
   -- 1. PATH CONFIGURATION (Mason/System & Workspace)
@@ -67,7 +71,10 @@ function M.setup(detected_root)
     capabilities = utils.make_capabilities(),
 
     init_options = {
-      bundles = {},
+      -- Microsoft java-debug-adapter + java-test JARs, loaded so jdtls can act as a
+      -- debug server (nvim-dap attaches through it). Empty list => debugging simply
+      -- unavailable until the Mason packages install; the LSP still works.
+      bundles = utils.get_dap_bundles(),
       extendedClientCapabilities = require('jdtls').extendedClientCapabilities,
     },
 
@@ -113,6 +120,21 @@ function M.setup(detected_root)
     on_attach = function(client, bufnr)
       -- Bind keymaps and code actions
       utils.setup_keymaps(bufnr)
+
+      -- Java debugging: register the dap adapter for this client and, since this is
+      -- a normal (small) Maven/Spring project, resolve main-class LAUNCH configs too
+      -- (cheap here; we deliberately skip this on the huge Hybris workspace). The
+      -- request is async so it never blocks attach. main-class resolution runs ONCE
+      -- per root (it is an LSP scan; re-running it on every buffer attach is wasted
+      -- work). Remote-attach configs are added separately by config.dap.
+      pcall(function()
+        require('jdtls').setup_dap({ hotcodereplace = 'auto' })
+        local root = client.config.root_dir or root_dir
+        if root and not M._dap_main_done[root] then
+          M._dap_main_done[root] = true
+          require('jdtls.dap').setup_dap_main_class_configs()
+        end
+      end)
 
       local msg = string.format(
         "Attached to: %s\nRoot: %s",

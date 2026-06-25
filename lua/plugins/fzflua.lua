@@ -45,6 +45,12 @@ end
 
 return {
   "ibhagwan/fzf-lua",
+  -- Every entry point calls require('fzf-lua') lazily inside a keymap/function, so
+  -- nothing needs it at startup. lazy.nvim's module shim loads it (and applies opts)
+  -- on the first such require — the first search — keeping startup lean. `cmd`
+  -- keeps :FzfLua available from the start (it loads the plugin on first use).
+  lazy = true,
+  cmd = "FzfLua",
   dependencies = { "nvim-tree/nvim-web-devicons" },
   opts = {
     -- 1. WINDOW OPTIONS

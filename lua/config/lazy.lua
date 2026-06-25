@@ -18,7 +18,10 @@ require("lazy").setup({ import = "plugins" }, {
     missing = true,
   },
   checker = {
-    enabled = true,
+    -- Off: the background git fetch/ls-remote across every plugin had notify=false,
+    -- so it cost network + subprocesses on startup/interval for zero visible benefit.
+    -- `:Lazy check` / `:Lazy update` still work on demand.
+    enabled = false,
     notify = false,
   },
   change_detection = {

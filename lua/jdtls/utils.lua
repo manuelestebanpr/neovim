@@ -144,6 +144,70 @@ function M.get_lombok_jar(jdtls_root)
   return nil
 end
 
+-- =============================================================================
+-- JAVA DEBUG (nvim-dap) support
+--
+-- jdtls becomes a debug server only when it is launched with the Microsoft
+-- java-debug-adapter plugin (and, for JUnit, java-test) loaded as OSGi bundles via
+-- init_options.bundles. These helpers locate those JARs (installed by Mason) and
+-- ensure they are present. Both *_setup.lua call get_dap_bundles() at jdtls start.
+-- =============================================================================
+
+-- Absolute paths of the debug-adapter + java-test JARs to hand jdtls as bundles.
+-- Returns an empty list when nothing is installed yet (jdtls still starts fine;
+-- debugging just won't be available until the packages are installed + LspRestart).
+function M.get_dap_bundles()
+  local mason = vim.fn.stdpath("data") .. "/mason/packages"
+  local bundles = {}
+
+  -- The debug adapter itself: exactly one com.microsoft.java.debug.plugin JAR.
+  vim.list_extend(bundles, vim.fn.glob(
+    mason .. "/java-debug-adapter/extension/server/com.microsoft.java.debug.plugin-*.jar",
+    true, true))
+
+  -- java-test: every server JAR drives test discovery/run/debug. The runner jar is
+  -- a standalone process (not an OSGi bundle) and must NOT be handed to jdtls, or
+  -- the server logs a bundle-resolution error on start.
+  for _, jar in ipairs(vim.fn.glob(mason .. "/java-test/extension/server/*.jar", true, true)) do
+    if not jar:match("com%.microsoft%.java%.test%.runner%-jar%-with%-dependencies%.jar$") then
+      table.insert(bundles, jar)
+    end
+  end
+
+  return bundles
+end
+
+-- Best-effort: make sure the Mason packages backing Java debugging are installed.
+-- Async (downloads in the background); on first install it notifies the user to
+-- :LspRestart so the running jdtls picks up the new bundles. No-op if already
+-- present or if mason-registry is unavailable.
+function M.ensure_dap_installed()
+  local ok, registry = pcall(require, "mason-registry")
+  if not ok then return end
+
+  local want = { "java-debug-adapter", "java-test" }
+  local function ensure()
+    local installing = {}
+    for _, name in ipairs(want) do
+      local ok_pkg, pkg = pcall(registry.get_package, name)
+      if ok_pkg and pkg and not pkg:is_installed() then
+        pcall(function() pkg:install() end)
+        table.insert(installing, name)
+      end
+    end
+    if #installing > 0 then
+      vim.notify(
+        "Installing Java debug adapters: " .. table.concat(installing, ", ") ..
+        ".\nRun :LspRestart once they finish to enable debugging.",
+        vim.log.levels.INFO, { title = "Java DAP" })
+    end
+  end
+
+  -- refresh() updates the registry index first (so get_package sees new packages);
+  -- fall back to a direct call on older mason without refresh.
+  if registry.refresh then registry.refresh(ensure) else ensure() end
+end
+
 
 -- Walk upward from `start_path` (inclusive) and return the first ancestor
 -- directory that CONTAINS one of the given marker sub-paths.
@@ -211,8 +275,15 @@ function M.get_platform_root()
   return find_ancestor_containing(vim.fn.getcwd(), { "bin/platform" })
 end
 
--- Detect whether we are inside a Hybris project or a normal Maven/Gradle one.
--- Returns: project_type ("hybris" | "normal"), root_dir (absolute path)
+-- Detect the project type so the caller can decide which language server to start.
+-- Returns: project_type, root_dir (absolute path). Types:
+--   "hybris" -> SAP Commerce platform (bin/platform present) -> Hybris jdtls.
+--   "maven"  -> a pom.xml / mvnw is present                  -> plain jdtls (Spring).
+--   "other"  -> anything else (gradle, bare git, loose file) -> NO jdtls; fall back
+--               to whatever Mason/vim.lsp auto-enables + generic cmp completion.
+-- This split is deliberate: jdtls only runs for the two project shapes the user
+-- actually wants it for (Hybris, Spring/Maven); every other Java file gets cheap,
+-- generic completion instead of a heavyweight language server.
 function M.detect_project(start_override)
   -- start_override (an absolute FILE path) lets callers resolve a project for a
   -- buffer other than the current one (e.g. lemminx root_dir, which is handed the
@@ -263,19 +334,23 @@ function M.detect_project(start_override)
     return "hybris", hybris_root
   end
 
-  -- 3. Normal Maven/Gradle/Git project.
-  local normal_root = find_ancestor_containing(start_path, {
-    "pom.xml",
-    "build.gradle",
-    "gradlew",
-    "mvnw",
-    ".git",
-  })
-  if normal_root then
-    return "normal", normal_root
+  -- 3. Maven / Spring project: a pom.xml (or the maven wrapper) is the SOLE trigger
+  --    for the plain jdtls Java language server outside Hybris. Walk up from the
+  --    file so a module inside a multi-module reactor still resolves to its pom.
+  local maven_root = find_ancestor_containing(start_path, { "pom.xml", "mvnw" })
+  if maven_root then
+    return "maven", maven_root
   end
 
-  return "normal", vim.fn.getcwd()
+  -- 4. Everything else (gradle, bare git, a loose .java): NOT a jdtls project. We
+  --    still hand back a sensible root for non-LSP callers (lemminx, pickers), but
+  --    the FileType router will NOT start jdtls here.
+  local other_root = find_ancestor_containing(start_path, {
+    "build.gradle",
+    "gradlew",
+    ".git",
+  })
+  return "other", other_root or vim.fn.getcwd()
 end
 
 -- Nearest ancestor directory that IS a Hybris extension root (i.e. directly

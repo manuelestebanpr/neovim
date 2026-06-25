@@ -1,5 +1,7 @@
 return {
   'nvim-lualine/lualine.nvim',
+  -- Statusline isn't needed before the UI is drawn; init it just after startup.
+  event = 'VeryLazy',
   dependencies = { 'nvim-tree/nvim-web-devicons' },
   config = function ()
     local sysmon = require('ai_assistant.sysmon')

@@ -1,6 +1,9 @@
 return {
     "ThePrimeagen/harpoon",
 	branch = "harpoon2", dependencies = { "nvim-lua/plenary.nvim" },
+	-- Reachable only through these keys, so load harpoon (and plenary) on first use
+	-- instead of at startup. config() then registers the real maps and the key replays.
+	keys = { "<leader>a", "<C-e>", "<C-h>", "<C-t>", "<C-n>", "<C-s>" },
 	config = function()
 		local harpoon = require("harpoon")
 

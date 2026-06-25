@@ -49,6 +49,7 @@ wk.setup({
   spec = {
     { "<leader>p",  group = "Project / Files" },  -- pv (explorer) + ps* (search)
     { "<leader>c",  group = "Code / AI" },         -- cc/cx/cp (AI) + ca/ca (LSP)
+    { "<leader>d",  group = "Debug (Java)" },      -- nvim-dap; maps load on first java file / key
   },
 })
 
@@ -99,4 +100,9 @@ wk.add({
 
   -- Pointer to the buffer-local LSP / JDTLS maps (Java files only)
   cheat("<leader>kj", "Java / LSP keys -> press <leader>? inside a .java buffer"),
+
+  -- Debugger function keys (nvim-dap; the full menu is under <leader>d)
+  cheat("<leader>kk", "[F5] Debug: Continue/Start  ·  [F9] Toggle Breakpoint"),
+  cheat("<leader>kl", "[F10] Step Over  ·  [F11] Step Into  ·  [S-F11] Step Out"),
+  cheat("<leader>km", "Debugger menu -> press <leader>d  (breakpoints, attach, UI, eval)"),
 })

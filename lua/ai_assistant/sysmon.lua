@@ -20,6 +20,12 @@ local prev_busy = nil
 local timer = nil
 local started = false
 local gpu_inflight = false
+-- Availability of each data source, probed ONCE in M.setup(). On macOS /proc is
+-- absent and nvidia-smi is missing, so without these guards every 2.5s tick paid a
+-- failed /proc open + a failed nvidia-smi process spawn, forever. On Linux+nvidia
+-- both flags are true and behavior is byte-for-byte identical to before.
+local has_proc = false
+local has_gpu = false
 
 local uv = vim.uv or vim.loop
 
@@ -125,11 +131,16 @@ local function sample_gpu()
   end
 end
 
--- One sampling tick: cheap synchronous reads + async GPU kick.
+-- One sampling tick: cheap synchronous reads + async GPU kick. Each source is
+-- guarded by its availability flag so an absent /proc or nvidia-smi costs nothing.
 local function tick()
-  pcall(sample_cpu)
-  pcall(sample_ram)
-  pcall(sample_gpu)
+  if has_proc then
+    pcall(sample_cpu)
+    pcall(sample_ram)
+  end
+  if has_gpu then
+    pcall(sample_gpu)
+  end
 end
 
 -- Start the repeating timer (idempotent).
@@ -139,6 +150,18 @@ function M.setup()
   end
   started = true
   if not uv then
+    return
+  end
+  -- Probe data sources once. /proc backs CPU+RAM (Linux only); nvidia-smi backs GPU.
+  local f = io.open("/proc/stat", "r")
+  if f then
+    f:close()
+    has_proc = true
+  end
+  has_gpu = vim.fn.executable("nvidia-smi") == 1
+  -- No sources on this machine (e.g. macOS without nvidia-smi): leave the gauges
+  -- blank exactly as before, but DON'T arm a timer that would only do failed work.
+  if not has_proc and not has_gpu then
     return
   end
   -- Take an immediate first sample so values appear promptly.

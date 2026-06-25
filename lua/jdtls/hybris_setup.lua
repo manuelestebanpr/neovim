@@ -307,6 +307,84 @@ local function update_classpath(ext_name, dependencies)
 end
 
 -- =============================================================================
+-- 4a. LIB IMPORT (lib/*.jar + web WEB-INF/lib/*.jar -> .classpath)
+--
+-- Make sure EVERY jar physically present in a custom extension's lib/ (and each web
+-- context's WEB-INF/lib) is referenced on its .classpath, so third-party jars
+-- resolve in jdtls. This is what "import the lib folder properly on each extension"
+-- means: a jar dropped into lib/ after the last ant build would otherwise be invisible
+-- to the language server.
+--
+-- Idempotent and additive: only jars NOT already on the classpath are injected
+-- (before </classpath>), after the SAME one-time .nvim_bak backup update_classpath
+-- uses, so <leader>clr reverts it. A GENERATED .classpath already lists its lib jars
+-- (generate_classpath_file), so this is a no-op there; the real win is custom
+-- extensions with a pre-existing/ant .classpath that predates a newly-added jar.
+--
+-- Scope: CUSTOM extensions only. Platform/standard modules ship a correct
+-- ant-generated .classpath (their lib is already on it), and we never rewrite those.
+-- Every custom extension in the workspace -- i.e. those in localextensions.xml, their
+-- transitive requires-extension deps, and all of bin/custom -- is covered by the
+-- Pass 1 loop that calls this.
+-- =============================================================================
+local function ensure_lib_entries(ext_name)
+  local ext_path = STATE.name_to_path[ext_name]
+  if not ext_path then return end
+  if not is_custom_extension(ext_path) then return end
+
+  local classpath_file = ext_path .. "/.classpath"
+  if vim.fn.filereadable(classpath_file) == 0 then return end
+
+  local lines = vim.fn.readfile(classpath_file)
+  local content = table.concat(lines, "\n")
+
+  -- Every candidate jar as an extension-relative path, matching ant's entry shape
+  -- (global lib/ unexported; web WEB-INF/lib unexported -- same as generate_classpath_file).
+  local rels = {}
+  for _, jar in ipairs(vim.fn.glob(ext_path .. "/lib/*.jar", true, true)) do
+    table.insert(rels, "lib/" .. vim.fn.fnamemodify(jar, ":t"))
+  end
+  for _, wd in ipairs({
+    "web/webroot/WEB-INF/lib",
+    "acceleratoraddon/web/webroot/WEB-INF/lib",
+    "commonweb/webroot/WEB-INF/lib",
+  }) do
+    for _, jar in ipairs(vim.fn.glob(ext_path .. "/" .. wd .. "/*.jar", true, true)) do
+      table.insert(rels, wd .. "/" .. vim.fn.fnamemodify(jar, ":t"))
+    end
+  end
+  table.sort(rels)
+
+  local to_add = {}
+  for _, rel in ipairs(rels) do
+    -- Dedup against the exact path="..." token already present (kind-agnostic, so a
+    -- jar listed as exported lib is still treated as present).
+    if not string.find(content, 'path="' .. rel .. '"', 1, true) then
+      table.insert(to_add, string.format('\t<classpathentry kind="lib" path="%s"/>', rel))
+    end
+  end
+  if #to_add == 0 then return end
+
+  -- Back up the ORIGINAL once (no-op if update_classpath already created it), so the
+  -- backup is always pre-modification and <leader>clr restores it faithfully.
+  local backup_file = classpath_file .. ".nvim_bak"
+  if vim.fn.filereadable(backup_file) == 0 then
+    vim.fn.writefile(lines, backup_file)
+  end
+
+  local new_lines = {}
+  for _, line in ipairs(lines) do
+    if string.find(line, "</classpath>", 1, true) then
+      for _, entry in ipairs(to_add) do table.insert(new_lines, entry) end
+    end
+    table.insert(new_lines, line)
+  end
+  vim.fn.writefile(new_lines, classpath_file)
+  vim.notify(string.format("%s: imported %d lib jar(s) into .classpath.", ext_name, #to_add),
+    vim.log.levels.INFO)
+end
+
+-- =============================================================================
 -- 4b. METADATA SYNTHESIS (generate missing .project / .classpath)
 --
 -- For CUSTOM extensions that ant never imported into Eclipse, JDT has no project
@@ -625,6 +703,10 @@ local function prepare_workspace()
       --    injects remaining TRANSITIVE deps, skipping any path="/DEP" already
       --    present, so no duplicates.
       update_classpath(name, custom_deps)
+
+      -- 4. Import the lib/ folder: ensure every jar physically in lib/ (and the web
+      --    WEB-INF/lib dirs) is on the .classpath so third-party jars resolve.
+      ensure_lib_entries(name)
     end
   end
 
@@ -856,7 +938,10 @@ local function build_lsp_config(cache)
     root_dir = cache.root_dir,
     capabilities = utils.make_capabilities(),
     init_options = {
-      bundles = {},
+      -- Microsoft java-debug-adapter + java-test JARs so jdtls doubles as a debug
+      -- server (nvim-dap attaches to a running Hybris JVM through it). Empty when
+      -- the Mason packages aren't installed yet -- the LSP is unaffected.
+      bundles = utils.get_dap_bundles(),
       extendedClientCapabilities = jdtls.extendedClientCapabilities,
       workspaceFolders = cache.workspace_folders,
     },
@@ -896,6 +981,24 @@ local function build_lsp_config(cache)
     },
     on_attach = function(client, b)
       utils.setup_keymaps(b)
+
+      -- Register the Java dap adapter for this client so you can ATTACH to a running
+      -- Hybris JVM (./hybrisserver.sh debug, JDWP :8000). We deliberately do NOT call
+      -- setup_dap_main_class_configs() here: resolving main classes across hundreds
+      -- of Hybris extensions is an expensive LSP scan, and the Hybris flow is remote
+      -- attach, not launch.
+      --
+      -- Only register if nvim-dap is ALREADY loaded: this on_attach also fires for
+      -- Hybris .xml buffers, and we must not let opening an items.xml eagerly pull in
+      -- the whole dap stack. Opening a .java file loads nvim-dap (ft=java) which runs
+      -- config.dap.setup anyway, so this is idempotent insurance. We delegate to
+      -- register_java (not bare setup_dap) so the main-class auto-discovery provider
+      -- stays DISABLED -- a bare setup_dap() here would re-register it and bring back
+      -- the expensive <leader>dc workspace scan.
+      if package.loaded['dap'] then
+        pcall(function() require('config.dap').register_java() end)
+      end
+
       client.config.settings = vim.tbl_deep_extend('force', client.config.settings, {
         files = {
           exclude = {
@@ -1124,21 +1227,36 @@ function M.maven_deps(opts)
   return { checked = checked, fixed = fixed, incomplete = incomplete, mvn = mvn }
 end
 
+-- =============================================================================
+-- <leader>clr -- revert the tree to its PRE-jdtls state.
+--
+-- Every .project/.classpath we add or touch lives in a CUSTOM extension. We undo
+-- our footprint by going DIRECTLY to the real custom-extension dirs (never an
+-- ignore-blind fd tree-walk, which silently missed gitignored markers and let
+-- generated .project files survive -- the bug this rewrite fixes), and applying a
+-- single, git-aware rule per file:
+--
+--   * file is git-TRACKED (committed)  -> it existed before us. NEVER delete it; if
+--     we injected into it, restore the .nvim_bak (un-inject) so `git status` is clean.
+--   * file is UNTRACKED                -> it is a tooling artifact (generated by us,
+--     or an ant/Eclipse leftover -- a fresh checkout has none, .classpath is even
+--     gitignored). DELETE it for a pristine tree.
+--
+-- Candidate dirs come from three deduped sources so nothing is missed: the IMPORTED
+-- workspace folders, a fresh ignore-safe extensioninfo.xml scan of bin/custom, and a
+-- defense-in-depth `fd -I` (no-ignore) sweep for our markers/backups. Scoped to
+-- custom only -- platform/module .project/.classpath are SAP's and never touched.
+-- =============================================================================
 function M.restore_backups()
-  -- Clean EVERY Hybris root touched this session, not just the last-imported one.
-  -- IMPORTED is keyed by resolved root -> frozen cache; iterate its roots so a
-  -- single <leader>clr reverts injections + deletes generated files across all of
-  -- them. (The old code leaned on the sticky shared CONF.HYBRIS_ROOT, so after a
-  -- :cd to a second root the first root's artifacts were silently left behind.)
-  local roots, seen = {}, {}
+  -- Roots touched this session (IMPORTED), or a freshly-resolved one for a cold
+  -- <leader>clr. Keyed by resolved root.
+  local roots, seen_root = {}, {}
   for root, cache in pairs(IMPORTED) do
-    if type(cache) == "table" and not seen[root] then
-      seen[root] = true
+    if type(cache) == "table" and not seen_root[root] then
+      seen_root[root] = true
       table.insert(roots, root)
     end
   end
-  -- Fallback when nothing was imported yet (e.g. <leader>clr in a fresh session):
-  -- resolve from env/cwd (validated) or the current buffer.
   if #roots == 0 then
     local _, dr = utils.detect_project()
     local r = utils.get_platform_root() or dr
@@ -1154,64 +1272,211 @@ function M.restore_backups()
     return
   end
 
-  local function list(search_dir, pat, glob)
-    if vim.fn.executable("fd") == 1 then
-      local r = vim.fn.systemlist({ "fd", "-L", "-H", "-t", "f", "-a", "--", pat, search_dir })
-      if vim.v.shell_error ~= 0 then return {} end
-      return r
+  local function resolved(p) return (vim.fn.resolve(p):gsub("/+$", "")) end
+
+  -- git-tracked .project/.classpath, resolved-absolute, memoised per repo toplevel.
+  -- Returns (set, ok). ok=false means git could NOT be queried (git absent, or
+  -- rev-parse/ls-files failed -- e.g. "dubious ownership", which the bin/custom ->
+  -- external-repo symlink makes likely). On ok=false we must FAIL CLOSED: a file is
+  -- only ever deleted on POSITIVE proof we created it (a .nvim_gen marker or our
+  -- signature), never merely because git couldn't confirm it as tracked. `-c
+  -- safe.directory=*` defuses the dubious-ownership case.
+  local GIT = { "git", "-c", "safe.directory=*" }
+  local tracked_cache = {}
+  local function tracked_info(dir)
+    if vim.fn.executable("git") == 0 then return {}, false end
+    local top = vim.fn.systemlist(vim.list_extend(vim.deepcopy(GIT),
+      { "-C", dir, "rev-parse", "--show-toplevel" }))
+    if vim.v.shell_error ~= 0 or not top[1] or top[1] == "" then return {}, false end
+    top = top[1]
+    if tracked_cache[top] then return tracked_cache[top].set, tracked_cache[top].ok end
+    local files = vim.fn.systemlist(vim.list_extend(vim.deepcopy(GIT),
+      { "-C", top, "ls-files", "--", "*.project", "*.classpath" }))
+    if vim.v.shell_error ~= 0 then
+      tracked_cache[top] = { set = {}, ok = false }
+      return {}, false
     end
-    return vim.fn.glob(search_dir .. glob, true, true)
+    local set = {}
+    for _, rel in ipairs(files) do
+      if rel ~= "" then set[resolved(top .. "/" .. rel)] = true end
+    end
+    tracked_cache[top] = { set = set, ok = true }
+    return set, true
   end
 
-  -- Does the sibling .nvim_gen marker list ".classpath"? If so the .classpath was
-  -- GENERATED by us (not a pre-existing user file), so its .nvim_bak must NOT be
-  -- counted/renamed as a user restore -- the 2nd pass deletes it instead.
-  local function generated_classpath(dir)
+  -- Ignore-SAFE marker/backup sweep (fd -I bypasses .gitignore/.fdignore/global
+  -- excludes; the no-ignore flag is the actual fix). Glob fallback when fd is absent.
+  local function sweep(dir, pat, glob)
+    if vim.fn.executable("fd") == 1 then
+      local r = vim.fn.systemlist({ "fd", "-L", "-H", "-I", "-t", "f", "-a", "--", pat, dir })
+      if vim.v.shell_error == 0 and #r > 0 then return r end
+    end
+    return vim.fn.glob(dir .. glob, true, true)
+  end
+
+  -- Basenames a sibling .nvim_gen marker records as GENERATED-from-scratch by us.
+  local function generated_set(dir)
     local marker = dir .. "/.nvim_gen"
-    if vim.fn.filereadable(marker) == 0 then return false end
-    for _, b in ipairs(vim.fn.readfile(marker)) do
-      if b == ".classpath" then return true end
+    local set = {}
+    if vim.fn.filereadable(marker) == 1 then
+      for _, b in ipairs(vim.fn.readfile(marker)) do set[b] = true end
+    end
+    return set
+  end
+
+  -- Does a file carry our generation signature? (orphan recovery when a marker was
+  -- lost). Only the first lines matter (the comment sits at line 3).
+  local function has_signature(path)
+    if vim.fn.filereadable(path) == 0 then return false end
+    for _, l in ipairs(vim.fn.readfile(path, "", 6)) do
+      if l:find("generated by nvim hybris_setup", 1, true) then return true end
     end
     return false
   end
 
-  local restored, deleted = 0, 0
-  for _, root in ipairs(valid_roots) do
-    local search_dir = root .. "/bin"
-    if vim.fn.isdirectory(search_dir) == 0 then search_dir = root end
-
-    -- 1st pass: restore .classpath files we INJECTED into (rename .nvim_bak back).
-    -- Skip backups that belong to a GENERATED .classpath (handled by the 2nd pass)
-    -- so the "restored" count reflects only genuine user files.
-    for _, bak in ipairs(list(search_dir, "\\.classpath\\.nvim_bak$", "/**/.classpath.nvim_bak")) do
-      if not generated_classpath(vim.fn.fnamemodify(bak, ":h")) then
-        vim.fn.rename(bak, (bak:gsub("%.nvim_bak$", "")))
-        restored = restored + 1
+  -- Undo our footprint in ONE custom-extension dir. Decision per file, in priority
+  -- order, so a file is removed ONLY on positive proof it is ours:
+  --   tracked (committed)        -> never delete; un-inject .nvim_bak if present.
+  --   generated (.nvim_gen lists)-> WE created it from scratch: delete it + backup.
+  --   has .nvim_bak              -> WE injected into a pre-existing file: restore it
+  --                                 (un-inject), preserving the original (ant/user).
+  --   carries our signature      -> our generated orphan (marker lost): delete.
+  --   else                       -> no evidence it is ours: LEAVE it (fail-safe; this
+  --                                 is what protects committed files when git is down).
+  local function clean_dir(dir, tracked, git_ok, counts)
+    local gen = generated_set(dir)
+    for _, base in ipairs({ ".classpath", ".project" }) do
+      local f = dir .. "/" .. base
+      local bak = f .. ".nvim_bak"
+      local is_tracked = git_ok and tracked[resolved(f)] == true
+      if is_tracked then
+        if vim.fn.filereadable(bak) == 1 then
+          vim.fn.rename(bak, f)
+          counts.restored = counts.restored + 1
+        end
+      elseif gen[base] then
+        if vim.fn.filereadable(f) == 1 then
+          vim.fn.delete(f)
+          counts.deleted = counts.deleted + 1
+        end
+        vim.fn.delete(bak)
+      elseif vim.fn.filereadable(bak) == 1 then
+        vim.fn.rename(bak, f)
+        counts.restored = counts.restored + 1
+      elseif has_signature(f) then
+        vim.fn.delete(f)
+        counts.deleted = counts.deleted + 1
+        vim.fn.delete(bak)
       end
+      -- else: leave it (no proof it is ours).
+    end
+    vim.fn.delete(dir .. "/.nvim_gen")
+  end
+
+  local counts = { restored = 0, deleted = 0 }
+  local processed = {}
+
+  for _, root in ipairs(valid_roots) do
+    local custom_real = resolved(root .. "/bin/custom")
+    local has_custom = vim.fn.isdirectory(custom_real) == 1
+    local function under_custom(dir)
+      if not has_custom then return false end
+      local rd = resolved(dir)
+      return rd == custom_real or rd:sub(1, #custom_real + 1) == custom_real .. "/"
     end
 
-    -- 2nd pass: delete files we GENERATED (recorded in sibling .nvim_gen markers).
-    -- A generated .classpath may also carry a .classpath.nvim_bak (from later
-    -- transitive injection); delete whatever .classpath/.project remains plus that
-    -- stray backup, then the marker, leaving the extension pristine.
-    for _, marker in ipairs(list(search_dir, "^\\.nvim_gen$", "/**/.nvim_gen")) do
-      local ext_dir = vim.fn.fnamemodify(marker, ":h")
-      for _, basename in ipairs(vim.fn.readfile(marker)) do
-        local target = ext_dir .. "/" .. basename
-        if vim.fn.filereadable(target) == 1 then
-          vim.fn.delete(target)
-          deleted = deleted + 1
+    local tracked, git_ok = {}, true
+    if has_custom then tracked, git_ok = tracked_info(custom_real) end
+
+    -- Collect candidate custom dirs (resolved-real, deduped).
+    local candidates = {}
+    local function add(dir)
+      if not dir or dir == "" then return end
+      local rd = resolved(dir)
+      if processed[rd] then return end
+      if not under_custom(rd) then return end
+      processed[rd] = true
+      candidates[#candidates + 1] = rd
+    end
+
+    -- (a) the exact dirs we imported (workspace folders, file:// real paths).
+    for r, cache in pairs(IMPORTED) do
+      if type(cache) == "table" and resolved(r) == resolved(root) then
+        for _, wf in ipairs(cache.workspace_folders or {}) do
+          add((wf:gsub("^file://", "")))
         end
-        vim.fn.delete(target .. ".nvim_bak")
       end
-      vim.fn.delete(marker)
+    end
+    -- (b) fresh, ignore-safe scan of every custom extension (extensioninfo.xml is a
+    --     tracked file, so it is never hidden by ignore rules) -- covers a cold session.
+    if has_custom then
+      for _, xml in ipairs(find_extensioninfo_files(custom_real)) do
+        add(vim.fs.dirname(xml))
+      end
+    end
+    -- (c) defense-in-depth: dirs that still hold one of our markers/backups but are
+    --     no longer in the extension map (renamed/removed extensions).
+    for _, m in ipairs(sweep(root .. "/bin", "^\\.nvim_gen$", "/**/.nvim_gen")) do
+      add(vim.fs.dirname(m))
+    end
+    for _, b in ipairs(sweep(root .. "/bin", "\\.classpath\\.nvim_bak$", "/**/.classpath.nvim_bak")) do
+      add(vim.fs.dirname(b))
+    end
+
+    for _, dir in ipairs(candidates) do
+      clean_dir(dir, tracked, git_ok, counts)
     end
   end
 
-  if restored == 0 and deleted == 0 then
-    vim.notify("No Hybris .classpath backups or generated files found.", vim.log.levels.INFO)
+  -- Final pass: committed .project/.classpath can be left DIRTY even after the above:
+  --   * the JDT server injects a <filteredResources> block (tagged
+  --     __CREATED_BY_JAVA_LANGUAGE_SERVER__) into .project on import, and
+  --   * our read/modify/write (and the un-inject restore) normalises the trailing
+  --     newline of a .classpath the file may not have had.
+  -- clean_dir never deletes a committed file, so these linger in `git status` -- the
+  -- exact leftover the user wants gone. Restore them to HEAD with `git checkout`, but
+  -- ONLY when the file is one we are responsible for: it sits in a custom-extension
+  -- dir WE processed this run, or it carries the jdtls signature. That keeps a
+  -- committed file in an extension we never touched (or a genuine hand-edit elsewhere)
+  -- safe. Runs once per repo toplevel we already queried (tracked_cache).
+  for top, info in pairs(tracked_cache) do
+    if info.ok then
+      local dirty = vim.fn.systemlist(vim.list_extend(vim.deepcopy(GIT),
+        { "-C", top, "diff", "--name-only", "--", "*.project", "*.classpath" }))
+      if vim.v.shell_error == 0 then
+        local revert = {}
+        for _, rel in ipairs(dirty) do
+          if rel ~= "" then
+            local abs = top .. "/" .. rel
+            local ours = processed[resolved(vim.fs.dirname(abs))] == true
+            if not ours then
+              local f = io.open(abs, "r")
+              if f then
+                local content = f:read("*a") or ""
+                f:close()
+                ours = content:find("__CREATED_BY_JAVA_LANGUAGE_SERVER__", 1, true) ~= nil
+              end
+            end
+            if ours then table.insert(revert, rel) end
+          end
+        end
+        if #revert > 0 then
+          local cmd = vim.list_extend(vim.deepcopy(GIT), { "-C", top, "checkout", "--" })
+          vim.list_extend(cmd, revert)
+          vim.fn.system(cmd)
+          if vim.v.shell_error == 0 then counts.reverted = (counts.reverted or 0) + #revert end
+        end
+      end
+    end
+  end
+
+  local reverted = counts.reverted or 0
+  if counts.restored == 0 and counts.deleted == 0 and reverted == 0 then
+    vim.notify("Hybris cleanup: nothing to revert (tree already pristine).", vim.log.levels.INFO)
   else
-    vim.notify(string.format("Hybris cleanup: restored %d .classpath, deleted %d generated file(s).", restored, deleted), vim.log.levels.INFO)
+    vim.notify(string.format(
+      "Hybris cleanup: deleted %d generated, restored %d injected, reverted %d jdtls-touched committed file(s).",
+      counts.deleted, counts.restored, reverted), vim.log.levels.INFO)
   end
 end
 

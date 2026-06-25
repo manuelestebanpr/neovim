@@ -210,14 +210,15 @@ vim.api.nvim_create_autocmd('FileType', {
       local hybris = require('jdtls.hybris_setup')
       hybris.import(root_dir)
       hybris.attach(args.buf, root_dir)
-    elseif ft == 'java' then
-      -- Normal Maven/Gradle project: only Java buffers start jdtls; a stray xml
-      -- file outside a Hybris tree should not spin up a Java language server
-      -- (lemminx handles such xml).
+    elseif project_type == 'maven' and ft == 'java' then
+      -- Maven / Spring project (a pom.xml was found): start the plain jdtls Java
+      -- language server. Only Java buffers trigger it; a stray xml is left to lemminx.
       require('jdtls.jdtls_setup').setup(root_dir)
     end
-    -- Any other non-Hybris filetype (lua/python/ts/...) is left to
-    -- mason-lspconfig automatic_enable + vim.lsp.enable.
+    -- Everything else gets NO jdtls on purpose: a Java file with no pom.xml and no
+    -- Hybris platform (gradle/bare project), and every non-Java filetype, falls back
+    -- to whatever mason-lspconfig automatic_enable + vim.lsp.enable provide, plus the
+    -- generic nvim-cmp buffer/path completion. jdtls is reserved for Hybris + Maven.
   end,
 })
 
